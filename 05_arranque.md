@@ -1,6 +1,4 @@
-# Día 1 — Lo que hacemos HOY (los 3)
-
-Esto es lo concreto de las primeras 2-3 horas. Si esto sale bien, el resto del proyecto fluye.
+#Lo que hacemos HOY (los 3)
 
 ## Parte 1 — Juntos (45 minutos)
 
