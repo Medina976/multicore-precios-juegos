@@ -1,6 +1,6 @@
 """
 seeding.py — Llenar la BD con 200+ juegos desde RAWG
-Dueña: Anthony
+Dueño: Anthony
 
 Correr UNA SOLA VEZ:
     python seeding.py

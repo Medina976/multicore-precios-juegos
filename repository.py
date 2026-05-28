@@ -1,6 +1,6 @@
 """
 repository.py — Capa de acceso a datos
-Dueña: Anthony
+Dueño: Anthony
 
 Brack y Felipe NO escriben SQL. Solo importan estas funciones:
 
