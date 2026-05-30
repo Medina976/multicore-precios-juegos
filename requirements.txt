@@ -1,4 +1,4 @@
-psycopg2-binary==2.9.9
+psycopg2-binary==2.9.10
 python-dotenv==1.0.1
 requests==2.32.3
 beautifulsoup4==4.12.3
@@ -6,4 +6,3 @@ fake-useragent==1.5.1
 fastapi==0.115.0
 uvicorn==0.30.6
 apscheduler==3.10.4
-
