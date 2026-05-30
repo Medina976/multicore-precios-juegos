@@ -1,7 +1,9 @@
 -- =====================================================================
 -- Proyecto Multicore — Esquema de BD
 -- Para correr en el SQL Editor de Supabase
--- Dueña: Anthony
+-- Dueño: Anthony
+--Hace falta conectar la bd a la API de RAWG para llenar la tabla de juegos (script de seeding)
+--Anthony debe de instalar la extensión de sql para ver errores y corregir algunas cosas.
 -- =====================================================================
 
 -- Tabla principal: catálogo de juegos
