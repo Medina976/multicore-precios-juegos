@@ -37,6 +37,9 @@ from scrapers.nintendo import ScraperNintendo
 from scrapers.metacritic import ScraperMetacritic
 from scrapers.hltb import ScraperHLTB
 
+from dotenv import load_dotenv
+load_dotenv(override=True)  # Carga las variables de entorno desde .env
+
 # Configuración
 WORKERS_JUEGOS = 10       # Nivel 1: cuántos juegos en paralelo
 WORKERS_FUENTES = 6       # Niveles 2 y 3: cuántas fuentes a la vez por juego
