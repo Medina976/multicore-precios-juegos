@@ -10,6 +10,7 @@ Esto desacopla a los tres y permite trabajar en paralelo.
 """
 from contextlib import contextmanager
 from typing import Optional
+from pathlib import Path
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -22,7 +23,10 @@ from psycopg2.pool import ThreadedConnectionPool
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+# Carga el .env desde la misma carpeta donde está este archivo (repository.py)
+# Sin esto, load_dotenv() puede buscar en el directorio de trabajo incorrecto.
+_ENV_PATH = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=_ENV_PATH)
 
 _pool: Optional[ThreadedConnectionPool] = None
 
@@ -30,10 +34,17 @@ _pool: Optional[ThreadedConnectionPool] = None
 def init_pool(minconn: int = 2, maxconn: int = 20) -> None:
     """Se llama UNA vez al inicio del programa."""
     global _pool
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise EnvironmentError(
+            "No se encontró DATABASE_URL.\n"
+            f"Verifica que exista el archivo .env en: {_ENV_PATH}\n"
+            "Contenido esperado: DATABASE_URL=postgresql://..."
+        )
     _pool = ThreadedConnectionPool(
         minconn,
         maxconn,
-        dsn=os.environ["DATABASE_URL"],  # de Supabase
+        dsn=db_url,
     )
 
 
@@ -127,7 +138,6 @@ def actualizar_precio(
     precio_regular: float | None = None,
 ) -> None:
     """Brack la llama cada vez que un scraper de tienda termina con éxito."""
-    # Detectar oferta comparando con el MSRP guardado en la tabla juegos
     en_oferta = False
     descuento = None
 
