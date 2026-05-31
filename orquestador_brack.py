@@ -1,9 +1,13 @@
 """
-orquestador.py — El corazón del proyecto
+orquestador.py — Arquivo que mantiene la lógica del proyecto
 Dueño: Brack
 
+Para realizar las pruebas secuenciales y paralelas, se pueden comentar/descomentar
+las llamadas a ejecutar_scraping_completo() y ejecutar_secuencial() en el bloque main.
+Esto en el momento de comprobar y refutar que la programación paralela es sumamente eficiente
+en comparación con la secuencial, especialmente en tareas de I/O como el scraping web.
+
 Aquí están los 3 niveles de paralelismo anidados.
-Esto es lo que el profesor va a evaluar más fuerte.
 
 ESQUEMA VISUAL:
     Nivel 1: ThreadPoolExecutor(10) sobre la lista de 200 juegos
@@ -16,7 +20,8 @@ ESQUEMA VISUAL:
             Esperar a que todas terminen, guardar en BD, siguiente juego.
 """
 import logging
-import time
+
+import time 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from repository import (
