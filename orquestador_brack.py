@@ -192,6 +192,7 @@ def ejecutar_secuencial() -> dict:
 if __name__ == "__main__":
     # Para el informe: correr ambas y comparar
     resultado_paralelo = ejecutar_scraping_completo()
+    # Estas líneas de abajo solo se decomentan para realizar la prueba secuencial del scrapping
     # resultado_secuencial = ejecutar_secuencial()
     # speedup = resultado_secuencial["duracion_segundos"] / resultado_paralelo["duracion_segundos"]
     # print(f"Speedup: {speedup:.2f}x")
