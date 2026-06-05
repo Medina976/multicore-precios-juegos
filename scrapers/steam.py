@@ -3,9 +3,13 @@ scrapers/steam.py
 Dueño: Brack
 
 Obtiene el precio actual de un juego en Steam usando la Storefront API
-pública de Steam (no requiere API key).
+publica de Steam (no requiere API key).
 
-Endpoint: https://store.steampowered.com/api/appdetails?appids={appid}&cc=us&filters=price_overview
+Endpoint principal:
+    https://store.steampowered.com/api/appdetails?appids={appid}&cc=us&filters=price_overview
+
+Endpoint de busqueda (fallback cuando no tenemos AppID):
+    https://store.steampowered.com/api/storesearch/?term={query}&cc=us&l=en
 
 Firma requerida por orquestador_brack.py:
     scraper.obtener_precio(juego: dict) -> dict
@@ -15,6 +19,13 @@ Retorna:
         "precio": float | None,
         "precio_regular": float | None,
     }
+
+NOTA: El seeding.py genera URLs del tipo
+    https://store.steampowered.com/search/?term=elden+ring
+en vez de URLs directas con AppID. Por eso este scraper:
+  1) Intenta extraer AppID de la URL si la tiene (formato /app/{id}/...).
+  2) Si no, busca el juego por titulo en la API de busqueda de Steam
+     y toma el primer resultado.
 """
 
 import re
@@ -27,17 +38,45 @@ log = logging.getLogger(__name__)
 
 _ua = UserAgent()
 
-# Número de reintentos ante errores de red
 _MAX_REINTENTOS = 3
 _ESPERA_BASE = 2  # segundos, se duplica en cada reintento
+
+_STEAM_SEARCH_API = "https://store.steampowered.com/api/storesearch/"
+_STEAM_APPDETAILS_API = "https://store.steampowered.com/api/appdetails"
 
 
 def _extraer_appid(url: str) -> str | None:
     """Extrae el AppID de Steam desde una URL del tipo:
     https://store.steampowered.com/app/1245620/Elden_Ring/
     """
-    match = re.search(r"/app/(\d+)/", url or "")
+    match = re.search(r"/app/(\d+)", url or "")
     return match.group(1) if match else None
+
+
+def _buscar_appid_por_titulo(titulo: str, timeout: int = 8) -> str | None:
+    """
+    Llama a la API de busqueda de Steam y devuelve el AppID del primer
+    resultado, o None si no hay resultados.
+    """
+    if not titulo:
+        return None
+    try:
+        headers = {"User-Agent": _ua.random}
+        resp = requests.get(
+            _STEAM_SEARCH_API,
+            params={"term": titulo, "cc": "us", "l": "en"},
+            headers=headers,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("items", [])
+        if not items:
+            return None
+        return str(items[0].get("id"))
+    except requests.RequestException as e:
+        log.debug(f"[Steam] Busqueda por titulo fallo para '{titulo}': {e}")
+        return None
 
 
 class ScraperSteam:
@@ -45,42 +84,54 @@ class ScraperSteam:
 
     def obtener_precio(self, juego: dict) -> dict:
         """
-        Parámetros
+        Parametros
         ----------
         juego : dict
-            Debe contener la clave 'urls_tiendas' con un sub-campo 'steam'.
-            Ejemplo: {'id': 1, 'titulo': 'Elden Ring',
-                      'urls_tiendas': {'steam': 'https://store.steampowered.com/app/1245620/...'}}
+            Debe contener al menos 'titulo' y opcionalmente 'urls_tiendas.steam'.
 
         Retorna
         -------
-        dict con claves 'precio' y 'precio_regular' (ambos float o None).
-        Lanza Exception si no se puede obtener el precio tras los reintentos.
+        dict con claves 'precio' y 'precio_regular' (float o None).
+        Lanza Exception si no se puede obtener el precio tras reintentos.
         """
         url_tienda = (juego.get("urls_tiendas") or {}).get("steam")
-        if not url_tienda:
-            raise ValueError(f"Juego {juego.get('id')} no tiene URL de Steam")
+        titulo = juego.get("titulo", "")
 
-        appid = _extraer_appid(url_tienda)
+        # 1) Intentar sacar AppID de la URL directa
+        appid = _extraer_appid(url_tienda) if url_tienda else None
+
+        # 2) Si no se pudo, buscar por titulo (este es el caso del seeding actual)
         if not appid:
-            raise ValueError(f"No se pudo extraer AppID de: {url_tienda}")
+            appid = _buscar_appid_por_titulo(titulo)
+            if appid:
+                log.debug(f"[Steam] AppID '{appid}' encontrado por busqueda de titulo '{titulo}'")
 
-        api_url = (
-            f"https://store.steampowered.com/api/appdetails"
-            f"?appids={appid}&cc=us&filters=price_overview"
-        )
+        if not appid:
+            # No hay forma de identificar el juego
+            log.warning(f"[Steam] No se pudo identificar AppID para '{titulo}' (url={url_tienda})")
+            return {"precio": None, "precio_regular": None}
 
+        # 3) Consultar precio con el AppID
         espera = _ESPERA_BASE
         for intento in range(1, _MAX_REINTENTOS + 1):
             try:
                 headers = {"User-Agent": _ua.random}
-                resp = requests.get(api_url, headers=headers, timeout=10)
+                resp = requests.get(
+                    _STEAM_APPDETAILS_API,
+                    params={
+                        "appids": appid,
+                        "cc": "us",
+                        "filters": "price_overview",
+                    },
+                    headers=headers,
+                    timeout=10,
+                )
                 resp.raise_for_status()
                 data = resp.json()
 
                 info = data.get(str(appid), {})
                 if not info.get("success"):
-                    # El juego no está disponible en la tienda US
+                    # El juego no esta disponible en la tienda US
                     return {"precio": None, "precio_regular": None}
 
                 precio_overview = info.get("data", {}).get("price_overview")
@@ -93,14 +144,14 @@ class ScraperSteam:
                 precio_regular = precio_overview["initial"] / 100
 
                 log.info(
-                    f"[Steam] {juego.get('titulo')} — ${precio:.2f} "
+                    f"[Steam] {titulo} (id={appid}) — ${precio:.2f} "
                     f"(regular: ${precio_regular:.2f})"
                 )
                 return {"precio": precio, "precio_regular": precio_regular}
 
             except requests.RequestException as e:
                 log.warning(
-                    f"[Steam] Intento {intento}/{_MAX_REINTENTOS} falló "
+                    f"[Steam] Intento {intento}/{_MAX_REINTENTOS} fallo "
                     f"para juego {juego.get('id')}: {e}"
                 )
                 if intento < _MAX_REINTENTOS:
