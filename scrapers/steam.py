@@ -26,6 +26,9 @@ en vez de URLs directas con AppID. Por eso este scraper:
   1) Intenta extraer AppID de la URL si la tiene (formato /app/{id}/...).
   2) Si no, busca el juego por titulo en la API de busqueda de Steam
      y toma el primer resultado.
+
+Mejora: se agrega throttling suave entre peticiones consecutivas
+  para evitar bloqueos por rate-limit de Steam (HTTP 429).
 """
 
 import re
@@ -39,9 +42,10 @@ log = logging.getLogger(__name__)
 _ua = UserAgent()
 
 _MAX_REINTENTOS = 3
-_ESPERA_BASE = 2  # segundos, se duplica en cada reintento
+_ESPERA_BASE = 2       # segundos, se duplica en cada reintento
+_THROTTLE_DELAY = 0.5  # pausa entre peticiones exitosas para evitar 429
 
-_STEAM_SEARCH_API = "https://store.steampowered.com/api/storesearch/"
+_STEAM_SEARCH_API    = "https://store.steampowered.com/api/storesearch/"
 _STEAM_APPDETAILS_API = "https://store.steampowered.com/api/appdetails"
 
 
@@ -56,7 +60,8 @@ def _extraer_appid(url: str) -> str | None:
 def _buscar_appid_por_titulo(titulo: str, timeout: int = 8) -> str | None:
     """
     Llama a la API de busqueda de Steam y devuelve el AppID del primer
-    resultado, o None si no hay resultados.
+    resultado cuyo nombre coincida aproximadamente con el titulo,
+    o None si no hay resultados.
     """
     if not titulo:
         return None
@@ -73,7 +78,17 @@ def _buscar_appid_por_titulo(titulo: str, timeout: int = 8) -> str | None:
         items = data.get("items", [])
         if not items:
             return None
+
+        # Preferir coincidencia exacta de nombre antes de tomar el primero
+        titulo_lower = titulo.lower()
+        for item in items:
+            nombre = (item.get("name") or "").lower()
+            if nombre == titulo_lower:
+                return str(item.get("id"))
+
+        # Si no hay coincidencia exacta, tomar el primero
         return str(items[0].get("id"))
+
     except requests.RequestException as e:
         log.debug(f"[Steam] Busqueda por titulo fallo para '{titulo}': {e}")
         return None
@@ -107,7 +122,6 @@ class ScraperSteam:
                 log.debug(f"[Steam] AppID '{appid}' encontrado por busqueda de titulo '{titulo}'")
 
         if not appid:
-            # No hay forma de identificar el juego
             log.warning(f"[Steam] No se pudo identificar AppID para '{titulo}' (url={url_tienda})")
             return {"precio": None, "precio_regular": None}
 
@@ -126,6 +140,14 @@ class ScraperSteam:
                     headers=headers,
                     timeout=10,
                 )
+
+                # Steam devuelve 429 cuando hay demasiadas peticiones
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", espera * 2))
+                    log.warning(f"[Steam] Rate limit (429), esperando {retry_after}s...")
+                    time.sleep(retry_after)
+                    continue
+
                 resp.raise_for_status()
                 data = resp.json()
 
@@ -147,6 +169,10 @@ class ScraperSteam:
                     f"[Steam] {titulo} (id={appid}) — ${precio:.2f} "
                     f"(regular: ${precio_regular:.2f})"
                 )
+
+                # Throttling suave para no saturar la API de Steam
+                time.sleep(_THROTTLE_DELAY)
+
                 return {"precio": precio, "precio_regular": precio_regular}
 
             except requests.RequestException as e:
