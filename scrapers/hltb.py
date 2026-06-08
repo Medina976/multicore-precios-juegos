@@ -2,15 +2,27 @@
 scrapers/hltb.py
 Dueño: Brack
 
-Extrae los tiempos de juego de HowLongToBeat.com usando su API
-internal de búsqueda (JSON POST), sin necesidad de Selenium.
+Extrae los tiempos de juego de HowLongToBeat.com.
 
-Mejora respecto a la versión anterior:
-  - El hash del endpoint ya NO está hardcodeado. Se extrae dinámicamente
-    de la página principal de HLTB la primera vez que se llama y se
-    cachea en memoria para el resto de la sesión.
-  - Si la extracción falla, se usa una lista de hashes conocidos como
-    fallback antes de lanzar excepción.
+ESTRATEGIA (3 capas, de más rápida a más robusta):
+    1. POST directo con hash cacheado (sin navegador).
+       → Si responde 200, se retorna inmediatamente.
+    2. Si el hash expiró (404/400): re-extracción del hash con requests
+       escaneando los chunks de Next.js.
+       → Si se obtiene un hash nuevo, se reintenta el POST.
+    3. Si requests también falla (HLTB bloquea la descarga de chunks):
+       se lanza Selenium headless para cargar la página completa con JS
+       y extraer el hash del bundle renderizado.
+       → Se retorna el hash fresco y se reintenta el POST.
+
+Por qué Selenium como último recurso y no como primera opción:
+    - Selenium es ~10x más lento que requests.
+    - En el orquestador se lanzan 10 juegos en paralelo; si cada uno
+      abriera un navegador la RAM se agotaría.
+    - Con el hash cacheado en memoria, el 99% de las llamadas pasan
+      por la capa 1 (POST directo, sin navegador).
+    - Solo se lanza Selenium cuando el hash realmente expiró y requests
+      no pudo obtener uno nuevo. Eso ocurre una vez por sesión, no por juego.
 
 Firma requerida por orquestador_brack.py:
     scraper.obtener_datos(juego: dict) -> dict
@@ -21,11 +33,17 @@ Retorna:
         "main_extra":     float | None,   # historia + extras
         "completionist":  float | None,   # 100% completionista
     }
+
+Dependencias adicionales (agregar a requirements.txt):
+    selenium>=4.20.0
+    webdriver-manager>=4.0.1
+    fake-useragent>=1.5.1     # ya estaba
 """
 
 import re
 import time
 import logging
+import threading
 import requests
 from fake_useragent import UserAgent
 
@@ -33,104 +51,187 @@ log = logging.getLogger(__name__)
 
 _ua = UserAgent()
 _MAX_REINTENTOS = 3
-_ESPERA_BASE = 2
+_ESPERA_BASE    = 2
 
-_HLTB_HOME     = "https://howlongtobeat.com/"
+_HLTB_HOME        = "https://howlongtobeat.com/"
 _HLTB_SEARCH_BASE = "https://howlongtobeat.com/api/search"
-_HLTB_REFERER  = "https://howlongtobeat.com/"
+_HLTB_REFERER     = "https://howlongtobeat.com/"
 
-# Hashes conocidos como fallback (más reciente primero)
-_HASHES_FALLBACK = [
-    "dfh4bhy6ol2cru08ry4",   # verificado 2026-05
-    "4e92b9cd0d735a14a9e3",  # verificado 2025-12
-    "2c5d5f8e9a1b3c7f6d4e",  # verificado 2025-09
-]
-
-# Cache en memoria: se rellena la primera vez que se necesita
+# ─── Caché de hash (compartido entre threads, protegido con lock) ────────────
 _hash_cache: str | None = None
+_hash_lock  = threading.Lock()
 
 
-def _extraer_hash_dinamico() -> str | None:
+# ═══════════════════════════════════════════════════════════════════════════
+# CAPA 2 — extracción de hash con requests (sin navegador)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _extraer_hash_via_requests() -> str | None:
     """
-    Descarga la página principal de HLTB y extrae el hash del endpoint
-    de búsqueda desde el bundle de Next.js.
+    Descarga la página principal de HLTB y sus chunks de Next.js con
+    requests (sin JS) e intenta extraer el hash del endpoint de búsqueda.
 
-    El hash aparece en patrones como:
-        fetch("/api/search/"+t+"/")  donde t = "<hash>"
-    o directamente como:
-        /api/search/dfh4bhy6ol2cru08ry4
+    Funciona cuando HLTB no bloquea el User-Agent y el hash está visible
+    en el HTML o en los primeros chunks JS.
     """
     try:
-        headers = {
-            "User-Agent": _ua.random,
-            "Accept": "text/html",
-        }
-        resp = requests.get(_HLTB_HOME, headers=headers, timeout=12)
+        hdrs = {"User-Agent": _ua.random, "Accept": "text/html,*/*"}
+        resp = requests.get(_HLTB_HOME, headers=hdrs, timeout=15)
         resp.raise_for_status()
         html = resp.text
 
-        # Patrón 1: hash directamente en una URL de la API
-        m = re.search(r'/api/search/([a-z0-9]{10,30})', html)
+        # Patrón directo en HTML/JS inlined
+        m = re.search(r'/api/search/([a-zA-Z0-9]{10,35})["\'/]', html)
         if m:
-            log.debug(f"[HLTB] Hash extraído (patrón URL): {m.group(1)}")
+            log.debug(f"[HLTB] Hash vía requests (HTML): {m.group(1)}")
             return m.group(1)
 
-        # Patrón 2: asignación de variable en el JS bundle
-        m = re.search(r'["\']([a-z0-9]{15,30})["\']\s*[,;]?\s*\/\*\s*hash\s*\*\/', html)
-        if m:
-            log.debug(f"[HLTB] Hash extraído (patrón comentario): {m.group(1)}")
-            return m.group(1)
-
-        # Patrón 3: buscar en scripts _next/static
-        script_urls = re.findall(r'"(/_next/static/chunks/[^"]+\.js)"', html)
-        for script_url in script_urls[:5]:  # revisar los primeros 5 chunks
+        # Buscar en chunks de Next.js — máx 8 para no tardar demasiado
+        chunk_urls = re.findall(r'"(/_next/static/chunks/[^"]+\.js)"', html)
+        for cu in chunk_urls[:8]:
             try:
-                s = requests.get(
-                    f"https://howlongtobeat.com{script_url}",
-                    headers=headers,
-                    timeout=8,
+                cs = requests.get(
+                    f"https://howlongtobeat.com{cu}",
+                    headers=hdrs,
+                    timeout=10,
                 )
-                m = re.search(r'/api/search/([a-z0-9]{10,30})', s.text)
+                m = re.search(r'/api/search/([a-zA-Z0-9]{10,35})["\'/]', cs.text)
                 if m:
-                    log.debug(f"[HLTB] Hash extraído de chunk JS: {m.group(1)}")
+                    log.debug(f"[HLTB] Hash vía requests (chunk JS): {m.group(1)}")
                     return m.group(1)
             except requests.RequestException:
                 continue
 
-        log.warning("[HLTB] No se pudo extraer hash dinámico de la página")
-        return None
-
     except requests.RequestException as e:
-        log.warning(f"[HLTB] Error al descargar página para extraer hash: {e}")
-        return None
+        log.debug(f"[HLTB] requests falló al extraer hash: {e}")
+
+    return None
 
 
-def _obtener_hash() -> str:
+# ═══════════════════════════════════════════════════════════════════════════
+# CAPA 3 — extracción de hash con Selenium headless (último recurso)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _extraer_hash_via_selenium() -> str | None:
+    """
+    Abre HLTB con un Chrome headless real. El navegador ejecuta todo el
+    JavaScript de Next.js, por lo que el bundle completo queda disponible
+    en el DOM y podemos extraer el hash desde el fuente renderizado.
+
+    Se usa webdriver-manager para descargar/mantener chromedriver
+    automáticamente (sin instalación manual).
+
+    Solo se llama cuando la capa 2 falla — típicamente una vez por sesión.
+    """
+    try:
+        # Importaciones aquí para no cargar Selenium si nunca se necesita
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.common.by import By
+        from webdriver_manager.chrome import ChromeDriverManager
+
+        log.info("[HLTB] Iniciando Selenium headless para extraer hash...")
+
+        opts = Options()
+        opts.add_argument("--headless=new")          # Chrome ≥112
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--window-size=1280,800")
+        opts.add_argument(f"user-agent={_ua.random}")
+        # Silenciar logs de Chrome en consola
+        opts.add_experimental_option("excludeSwitches", ["enable-logging"])
+
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=opts,
+        )
+        try:
+            driver.get(_HLTB_HOME)
+
+            # Esperar hasta que el body tenga contenido real (página cargada)
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.TAG_NAME, "main"))
+            )
+
+            # Dar tiempo extra para que los chunks JS asíncronos terminen
+            time.sleep(2)
+
+            page_source = driver.page_source
+
+            # 1. Buscar en el HTML renderizado
+            m = re.search(r'/api/search/([a-zA-Z0-9]{10,35})["\'/]', page_source)
+            if m:
+                log.info(f"[HLTB] Hash extraído con Selenium (page_source): {m.group(1)}")
+                return m.group(1)
+
+            # 2. Buscar en los scripts cargados por el navegador
+            scripts = driver.find_elements(By.TAG_NAME, "script")
+            for script in scripts:
+                src = script.get_attribute("src") or ""
+                if "/_next/static/chunks" not in src:
+                    continue
+                try:
+                    # Hacer fetch del chunk desde el navegador (evita CORS/bloqueos)
+                    contenido = driver.execute_script(
+                        """const r = await fetch(arguments[0]);
+                           return await r.text();""",
+                        src,
+                    )
+                    m2 = re.search(r'/api/search/([a-zA-Z0-9]{10,35})["\'/]', contenido or "")
+                    if m2:
+                        log.info(f"[HLTB] Hash extraído con Selenium (chunk): {m2.group(1)}")
+                        return m2.group(1)
+                except Exception:
+                    continue
+
+        finally:
+            driver.quit()
+
+    except Exception as e:
+        log.error(f"[HLTB] Selenium falló al extraer hash: {e}")
+
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Gestión del caché del hash
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _obtener_hash(forzar_refresh: bool = False) -> str | None:
     """
     Retorna el hash del endpoint de búsqueda de HLTB.
-    Usa caché en memoria; si no hay caché, lo extrae dinámicamente;
-    si falla, usa los hashes de fallback.
+    Usa caché en memoria (thread-safe).
+    Si forzar_refresh=True, ignora el caché y lo extrae de nuevo.
     """
     global _hash_cache
-    if _hash_cache:
+
+    with _hash_lock:
+        if _hash_cache and not forzar_refresh:
+            return _hash_cache
+
+        log.info("[HLTB] Extrayendo hash dinámico (capa 2: requests)...")
+        h = _extraer_hash_via_requests()
+
+        if not h:
+            log.warning("[HLTB] Capa 2 falló. Usando Selenium (capa 3)...")
+            h = _extraer_hash_via_selenium()
+
+        if h:
+            _hash_cache = h
+            log.info(f"[HLTB] Hash cacheado: {h}")
+        else:
+            log.error("[HLTB] No se pudo obtener el hash por ningún método.")
+
         return _hash_cache
 
-    hash_dinamico = _extraer_hash_dinamico()
-    if hash_dinamico:
-        _hash_cache = hash_dinamico
-        return _hash_cache
 
-    # Fallback: usar el más reciente conocido
-    log.warning("[HLTB] Usando hash de fallback (puede estar desactualizado)")
-    _hash_cache = _HASHES_FALLBACK[0]
-    return _hash_cache
-
-
-def _reset_hash_cache():
-    """Limpia el caché del hash para forzar re-extracción (útil si el hash expiró)."""
-    global _hash_cache
-    _hash_cache = None
-
+# ═══════════════════════════════════════════════════════════════════════════
+# ScraperHLTB — clase pública consumida por el orquestador
+# ═══════════════════════════════════════════════════════════════════════════
 
 class ScraperHLTB:
     """Scraper para tiempos de juego de HowLongToBeat."""
@@ -150,18 +251,11 @@ class ScraperHLTB:
         if not titulo:
             raise ValueError(f"Juego {juego.get('id')} no tiene título")
 
-        headers = {
-            "User-Agent": _ua.random,
-            "Referer": _HLTB_REFERER,
-            "Origin": "https://howlongtobeat.com",
-            "Content-Type": "application/json",
-        }
-
         payload = {
             "searchType": "games",
             "searchTerms": titulo.split(),
             "searchPage": 1,
-            "size": 3,
+            "size": 5,
             "searchOptions": {
                 "games": {
                     "userId": 0,
@@ -182,70 +276,80 @@ class ScraperHLTB:
             "useCache": True,
         }
 
-        espera = _ESPERA_BASE
-        intentos_con_hash_actual = 0
+        espera        = _ESPERA_BASE
+        hash_invalido = False   # bandera para forzar refresh en el 2.º intento
 
         for intento in range(1, _MAX_REINTENTOS + 1):
-            hash_actual = _obtener_hash()
-            search_url = f"{_HLTB_SEARCH_BASE}/{hash_actual}"
+
+            # Si el intento anterior detectó hash inválido, forzar re-extracción
+            h = _obtener_hash(forzar_refresh=hash_invalido)
+            hash_invalido = False
+
+            if not h:
+                log.error(f"[HLTB] Sin hash disponible para '{titulo}'. Abortando.")
+                return {"main": None, "main_extra": None, "completionist": None}
+
+            search_url = f"{_HLTB_SEARCH_BASE}/{h}"
+            hdrs = {
+                "User-Agent": _ua.random,
+                "Referer":    _HLTB_REFERER,
+                "Origin":     "https://howlongtobeat.com",
+                "Content-Type": "application/json",
+                "Accept":     "application/json, text/plain, */*",
+            }
 
             try:
-                resp = requests.post(
-                    search_url, json=payload, headers=headers, timeout=12
-                )
+                resp = requests.post(search_url, json=payload, headers=hdrs, timeout=15)
 
-                # Si el hash expiró, HLTB devuelve 400 o 404
+                # Hash expirado: HLTB devuelve 400 o 404
                 if resp.status_code in (400, 404):
-                    log.warning(f"[HLTB] Hash '{hash_actual}' ya no es válido, re-extrayendo...")
-                    _reset_hash_cache()
-                    # Intentar con los hashes de fallback
-                    for hash_fb in _HASHES_FALLBACK:
-                        try:
-                            r2 = requests.post(
-                                f"{_HLTB_SEARCH_BASE}/{hash_fb}",
-                                json=payload,
-                                headers=headers,
-                                timeout=12,
-                            )
-                            if r2.status_code == 200:
-                                global _hash_cache
-                                _hash_cache = hash_fb
-                                log.info(f"[HLTB] Hash de fallback funcionó: {hash_fb}")
-                                resp = r2
-                                break
-                        except requests.RequestException:
-                            continue
+                    log.warning(
+                        f"[HLTB] Hash '{h}' expiró (HTTP {resp.status_code}). "
+                        f"Forzando re-extracción en intento {intento+1}..."
+                    )
+                    hash_invalido = True
+                    if intento < _MAX_REINTENTOS:
+                        time.sleep(espera)
+                        espera *= 2
+                    continue
+
+                # Rate limit
+                if resp.status_code == 429:
+                    log.warning(f"[HLTB] Rate limit (429). Esperando {espera}s...")
+                    time.sleep(espera)
+                    espera *= 2
+                    continue
 
                 resp.raise_for_status()
                 data = resp.json()
 
                 resultados = data.get("data", [])
                 if not resultados:
-                    log.warning(f"[HLTB] Sin resultados para: {titulo}")
+                    log.warning(f"[HLTB] Sin resultados para: '{titulo}'")
                     return {"main": None, "main_extra": None, "completionist": None}
 
-                # Buscar el resultado con título más parecido
+                # Seleccionar el resultado con título más parecido al buscado
                 titulo_lower = titulo.lower()
-                r = resultados[0]
+                mejor = resultados[0]
                 for res in resultados:
                     nombre_res = (res.get("game_name") or "").lower()
                     if nombre_res == titulo_lower:
-                        r = res
+                        mejor = res
                         break
 
-                def _horas(segundos) -> float | None:
-                    """HLTB devuelve segundos; convertimos a horas con 1 decimal."""
+                def _seg_a_horas(segundos) -> float | None:
+                    """HLTB almacena los tiempos en segundos; convertimos a horas."""
                     if not segundos:
                         return None
-                    return round(segundos / 3600, 1)
+                    return round(int(segundos) / 3600, 1)
 
                 resultado = {
-                    "main":          _horas(r.get("comp_main")),
-                    "main_extra":    _horas(r.get("comp_plus")),
-                    "completionist": _horas(r.get("comp_100")),
+                    "main":          _seg_a_horas(mejor.get("comp_main")),
+                    "main_extra":    _seg_a_horas(mejor.get("comp_plus")),
+                    "completionist": _seg_a_horas(mejor.get("comp_100")),
                 }
 
-                log.info(f"[HLTB] {titulo} — {resultado}")
+                log.info(f"[HLTB] {titulo} → {resultado}")
                 return resultado
 
             except requests.RequestException as e:
@@ -256,5 +360,6 @@ class ScraperHLTB:
                 if intento < _MAX_REINTENTOS:
                     time.sleep(espera)
                     espera *= 2
-                else:
-                    return {"main": None, "main_extra": None, "completionist": None}
+
+        log.error(f"[HLTB] Agotados {_MAX_REINTENTOS} intentos para '{titulo}'")
+        return {"main": None, "main_extra": None, "completionist": None}

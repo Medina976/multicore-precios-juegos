@@ -1,8 +1,19 @@
+# Base de datos
 psycopg2-binary==2.9.10
 python-dotenv==1.0.1
+
+# HTTP / scraping
 requests==2.32.3
 beautifulsoup4==4.12.3
 fake-useragent==1.5.1
+
+# Selenium (para extracción robusta del hash de HLTB)
+selenium>=4.20.0
+webdriver-manager>=4.0.1
+
+# Backend FastAPI
 fastapi==0.115.0
 uvicorn==0.30.6
+
+# Scheduler (para correr el scraping periódico)
 apscheduler==3.10.4
