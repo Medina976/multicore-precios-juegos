@@ -8,6 +8,8 @@ Endpoints:
     GET /api/status          → última actualización y total de juegos
 
 Docs automáticas (Swagger): http://localhost:8000/docs
+Para ingresar a la página principal del frontend: http://localhost:8000/
+
 
 Correr localmente:
     python main.py
