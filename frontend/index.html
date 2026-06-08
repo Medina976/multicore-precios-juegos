@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Multicore Precios Juegos</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  /* ─── Variables ─── */
+  :root {
+    --bg:       #080a10;
+    --surface:  #0f1118;
+    --card:     #13161f;
+    --border:   #1e2233;
+    --border-2: #2a2f44;
+    --text:     #dde1f0;
+    --muted:    #636880;
+    --dim:      #3a3f55;
+    --green:    #39d353;
+    --amber:    #f5a623;
+    --blue:     #4e8ef7;
+    --red:      #ff5252;
+    --yellow:   #ffc107;
+    --mono:     'IBM Plex Mono', monospace;
+    --sans:     'IBM Plex Sans', sans-serif;
+    --radius:   10px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+  }
+
+  /* ─── Nav ─── */
+  nav {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .logo {
+    font-family: var(--mono);
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--green);
+    letter-spacing: -.5px;
+  }
+
+  .logo span { color: var(--muted); font-weight: 400; }
+
+  #status-bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-family: var(--mono);
+    font-size: .72rem;
+    color: var(--muted);
+  }
+
+  .status-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    display: inline-block;
+    margin-right: 6px;
+    animation: pulse 2s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: .3; }
+  }
+
+  /* ─── Filtros ─── */
+  .filters {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .filter-label {
+    font-family: var(--mono);
+    font-size: .7rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    margin-right: 2px;
+  }
+
+  select, button.toggle {
+    background: var(--card);
+    border: 1px solid var(--border-2);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: .82rem;
+    padding: 7px 12px;
+    cursor: pointer;
+    transition: border-color .15s;
+    outline: none;
+  }
+
+  select:hover, button.toggle:hover {
+    border-color: var(--dim);
+  }
+
+  button.toggle.active {
+    background: rgba(57,211,83,.12);
+    border-color: var(--green);
+    color: var(--green);
+  }
+
+  .separator { width: 1px; height: 24px; background: var(--border); margin: 0 4px; }
+
+  #total-badge {
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: .72rem;
+    color: var(--muted);
+  }
+
+  /* ─── Grid de cards ─── */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 16px;
+    padding: 24px;
+  }
+
+  /* ─── Card ─── */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    cursor: pointer;
+    transition: transform .18s, border-color .18s, box-shadow .18s;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .card:hover {
+    transform: translateY(-4px);
+    border-color: var(--border-2);
+    box-shadow: 0 8px 32px rgba(0,0,0,.5);
+  }
+
+  .card-img {
+    width: 100%;
+    aspect-ratio: 16/9;
+    object-fit: cover;
+    background: var(--surface);
+    display: block;
+    position: relative;
+  }
+
+  .card-img-wrap {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .badge-discount {
+    position: absolute;
+    top: 8px; left: 8px;
+    background: var(--green);
+    color: #000;
+    font-family: var(--mono);
+    font-size: .7rem;
+    font-weight: 600;
+    padding: 3px 7px;
+    border-radius: 4px;
+  }
+
+  .badge-score {
+    position: absolute;
+    top: 8px; right: 8px;
+    width: 36px; height: 36px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--mono);
+    font-size: .78rem;
+    font-weight: 600;
+    border: 2px solid rgba(0,0,0,.4);
+    color: #fff;
+  }
+
+  .score-high  { background: #2b6e2b; border-color: var(--green); }
+  .score-mid   { background: #6e6010; border-color: var(--yellow); }
+  .score-low   { background: #6e1f1f; border-color: var(--red); }
+  .score-none  { background: var(--surface); border-color: var(--dim); color: var(--muted); }
+
+  .card-body {
+    padding: 12px 14px 14px;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .card-title {
+    font-size: .9rem;
+    font-weight: 600;
+    line-height: 1.3;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    color: var(--text);
+  }
+
+  .platforms {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .platform {
+    font-size: .65rem;
+    font-family: var(--mono);
+    padding: 2px 6px;
+    border-radius: 3px;
+    border: 1px solid;
+  }
+
+  .p-switch { color: #b48ef7; border-color: #b48ef740; background: #b48ef710; }
+  .p-ps5, .p-ps4 { color: #4e8ef7; border-color: #4e8ef740; background: #4e8ef710; }
+  .p-xbox { color: var(--green); border-color: #39d35340; background: #39d35310; }
+  .p-pc   { color: #aaa; border-color: #aaa4; background: #aaa1; }
+
+  .card-price {
+    margin-top: auto;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+
+  .price-main {
+    font-family: var(--mono);
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--amber);
+  }
+
+  .price-original {
+    font-family: var(--mono);
+    font-size: .78rem;
+    color: var(--muted);
+    text-decoration: line-through;
+  }
+
+  .price-none {
+    font-family: var(--mono);
+    font-size: .8rem;
+    color: var(--dim);
+  }
+
+  /* ─── Estado vacío / loading ─── */
+  .empty-state {
+    grid-column: 1/-1;
+    text-align: center;
+    padding: 80px 20px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: .9rem;
+  }
+
+  .skeleton {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    animation: shimmer 1.4s infinite;
+  }
+
+  .skeleton-img { width: 100%; aspect-ratio: 16/9; background: var(--surface); }
+  .skeleton-body { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 8px; }
+  .skeleton-line { height: 12px; border-radius: 4px; background: var(--border-2); }
+  .skeleton-line.short { width: 60%; }
+  .skeleton-line.medium { width: 80%; }
+
+  @keyframes shimmer {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: .5; }
+  }
+
+  /* ─── Modal ─── */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.75);
+    z-index: 200;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    backdrop-filter: blur(4px);
+  }
+
+  .modal-overlay.open { display: flex; }
+
+  .modal {
+    background: var(--surface);
+    border: 1px solid var(--border-2);
+    border-radius: 14px;
+    width: 100%;
+    max-width: 640px;
+    max-height: 90vh;
+    overflow-y: auto;
+    animation: modalIn .2s ease;
+  }
+
+  @keyframes modalIn {
+    from { opacity: 0; transform: scale(.96); }
+    to   { opacity: 1; transform: scale(1);   }
+  }
+
+  .modal-header {
+    position: relative;
+  }
+
+  .modal-img {
+    width: 100%;
+    aspect-ratio: 16/7;
+    object-fit: cover;
+    border-radius: 14px 14px 0 0;
+    display: block;
+    background: var(--card);
+  }
+
+  .modal-header-info {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    padding: 32px 20px 16px;
+    background: linear-gradient(transparent, rgba(8,10,16,.95));
+  }
+
+  .modal-title {
+    font-size: 1.3rem;
+    font-weight: 700;
+    line-height: 1.25;
+    margin-bottom: 8px;
+  }
+
+  .modal-close {
+    position: absolute;
+    top: 12px; right: 12px;
+    background: rgba(0,0,0,.6);
+    border: none;
+    color: var(--text);
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 1rem;
+    display: flex; align-items: center; justify-content: center;
+    transition: background .15s;
+  }
+
+  .modal-close:hover { background: rgba(255,255,255,.15); }
+
+  .modal-body { padding: 20px; display: flex; flex-direction: column; gap: 20px; }
+
+  .modal-section h3 {
+    font-family: var(--mono);
+    font-size: .7rem;
+    text-transform: uppercase;
+    letter-spacing: .1em;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+
+  /* Tabla de precios */
+  .prices-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: .85rem;
+  }
+
+  .prices-table th {
+    text-align: left;
+    padding: 6px 10px;
+    font-family: var(--mono);
+    font-size: .68rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .prices-table td {
+    padding: 10px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+  }
+
+  .prices-table tr:last-child td { border-bottom: none; }
+
+  .store-name {
+    font-family: var(--mono);
+    font-weight: 600;
+    text-transform: capitalize;
+  }
+
+  .store-steam   { color: #a8c5e8; }
+  .store-nintendo { color: #ff6b6b; }
+
+  .deal-badge {
+    display: inline-block;
+    background: rgba(57,211,83,.15);
+    color: var(--green);
+    border: 1px solid #39d35340;
+    font-family: var(--mono);
+    font-size: .68rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-left: 6px;
+  }
+
+  .store-link {
+    color: var(--blue);
+    text-decoration: none;
+    font-size: .78rem;
+    opacity: .7;
+    transition: opacity .15s;
+  }
+
+  .store-link:hover { opacity: 1; }
+
+  /* Scores */
+  .scores-grid {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .score-chip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+  }
+
+  .score-num {
+    font-family: var(--mono);
+    font-size: 1rem;
+    font-weight: 600;
+  }
+
+  .score-platform {
+    font-size: .78rem;
+    color: var(--muted);
+  }
+
+  /* HLTB */
+  .hltb-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+  }
+
+  .hltb-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    text-align: center;
+  }
+
+  .hltb-hours {
+    font-family: var(--mono);
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: var(--amber);
+    display: block;
+  }
+
+  .hltb-label {
+    font-size: .7rem;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+</style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav>
+  <div class="logo">// <span>multicore</span>precios.juegos</div>
+  <div id="status-bar">
+    <span><span class="status-dot"></span><span id="ultima-actualizacion">cargando...</span></span>
+    <span id="total-juegos">—</span>
+  </div>
+</nav>
+
+<!-- Filtros -->
+<div class="filters">
+  <span class="filter-label">Plataforma</span>
+  <select id="f-plataforma">
+    <option value="">Todas</option>
+    <option>Switch</option>
+    <option>PS5</option>
+    <option>PS4</option>
+    <option>Xbox</option>
+    <option>PC</option>
+  </select>
+
+  <div class="separator"></div>
+
+  <span class="filter-label">Tienda</span>
+  <select id="f-tienda">
+    <option value="">Todas</option>
+    <option value="steam">Steam</option>
+    <option value="nintendo">Nintendo</option>
+  </select>
+
+  <div class="separator"></div>
+
+  <button class="toggle" id="f-oferta">Solo ofertas</button>
+
+  <div class="separator"></div>
+
+  <span class="filter-label">Orden</span>
+  <select id="f-orden">
+    <option value="nombre">Nombre</option>
+    <option value="precio">Precio ↑</option>
+    <option value="descuento">Descuento ↓</option>
+    <option value="score">Score ↓</option>
+  </select>
+
+  <span id="total-badge">— juegos</span>
+</div>
+
+<!-- Grid -->
+<div class="grid" id="grid"></div>
+
+<!-- Modal de detalle -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal" id="modal">
+    <div class="modal-header">
+      <img class="modal-img" id="modal-img" src="" alt="">
+      <button class="modal-close" id="modal-close">✕</button>
+      <div class="modal-header-info">
+        <div class="platforms" id="modal-platforms"></div>
+        <h2 class="modal-title" id="modal-title"></h2>
+      </div>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<script>
+  // ─── Estado ───
+  const state = {
+    plataforma: '',
+    tienda: '',
+    en_oferta: false,
+    orden: 'nombre',
+  };
+
+  // ─── Helpers ───
+  function scoreClass(n) {
+    if (n == null) return 'score-none';
+    if (n >= 75)   return 'score-high';
+    if (n >= 50)   return 'score-mid';
+    return 'score-low';
+  }
+
+  function platformClass(p) {
+    const m = { Switch:'p-switch', PS5:'p-ps5', PS4:'p-ps4', Xbox:'p-xbox', PC:'p-pc' };
+    return m[p] || 'p-pc';
+  }
+
+  function timeAgo(iso) {
+    if (!iso) return 'nunca';
+    const mins = Math.floor((Date.now() - new Date(iso)) / 60000);
+    if (mins < 1)  return 'hace un momento';
+    if (mins < 60) return `hace ${mins} min`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24)  return `hace ${hrs}h`;
+    return `hace ${Math.floor(hrs/24)}d`;
+  }
+
+  function fmt(n) {
+    if (n == null) return null;
+    return '$' + Number(n).toFixed(2);
+  }
+
+  // ─── Skeletons ───
+  function showSkeletons(n = 12) {
+    const grid = document.getElementById('grid');
+    grid.innerHTML = Array.from({length: n}, () => `
+      <div class="skeleton">
+        <div class="skeleton-img"></div>
+        <div class="skeleton-body">
+          <div class="skeleton-line medium"></div>
+          <div class="skeleton-line short"></div>
+          <div class="skeleton-line short"></div>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  // ─── Render cards ───
+  function renderCards(juegos) {
+    const grid = document.getElementById('grid');
+    document.getElementById('total-badge').textContent = `${juegos.length} juegos`;
+
+    if (!juegos.length) {
+      grid.innerHTML = `<div class="empty-state">No hay juegos con esos filtros.</div>`;
+      return;
+    }
+
+    grid.innerHTML = juegos.map(j => {
+      const scoreN    = j.mejor_score;
+      const scoreHtml = `<div class="badge-score ${scoreClass(scoreN)}">${scoreN ?? '—'}</div>`;
+      const discHtml  = j.porcentaje_descuento
+        ? `<div class="badge-discount">-${Math.round(j.porcentaje_descuento)}%</div>`
+        : '';
+
+      const priceHtml = j.mejor_precio != null
+        ? `<span class="price-main">${fmt(j.mejor_precio)}</span>
+           ${j.precio_sugerido && j.mejor_precio < j.precio_sugerido
+             ? `<span class="price-original">${fmt(j.precio_sugerido)}</span>`
+             : ''}`
+        : `<span class="price-none">Sin precio</span>`;
+
+      const platforms = (j.consolas || []).map(p =>
+        `<span class="platform ${platformClass(p)}">${p}</span>`
+      ).join('');
+
+      const img = j.imagen_url
+        ? `<img class="card-img" src="${j.imagen_url}" alt="${j.titulo}" loading="lazy">`
+        : `<div class="card-img" style="background:var(--surface)"></div>`;
+
+      return `
+        <div class="card" onclick="openModal(${j.id})">
+          <div class="card-img-wrap">
+            ${img}
+            ${discHtml}
+            ${scoreHtml}
+          </div>
+          <div class="card-body">
+            <div class="card-title">${j.titulo}</div>
+            <div class="platforms">${platforms}</div>
+            <div class="card-price">${priceHtml}</div>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  // ─── Cargar juegos ───
+  async function cargarJuegos() {
+    showSkeletons();
+    const params = new URLSearchParams();
+    if (state.plataforma) params.set('plataforma', state.plataforma);
+    if (state.tienda)     params.set('tienda',     state.tienda);
+    if (state.en_oferta)  params.set('en_oferta',  'true');
+    params.set('orden', state.orden);
+    params.set('limit', '200');
+
+    try {
+      const res  = await fetch(`/api/juegos?${params}`);
+      const data = await res.json();
+      renderCards(data.juegos || []);
+      if (data.ultima_actualizacion) {
+        document.getElementById('ultima-actualizacion').textContent =
+          `actualizado ${timeAgo(data.ultima_actualizacion)}`;
+      }
+    } catch {
+      document.getElementById('grid').innerHTML =
+        `<div class="empty-state">No se pudo conectar con la API.<br>Verificá que el servidor esté corriendo.</div>`;
+    }
+  }
+
+  // ─── Status polling ───
+  async function actualizarStatus() {
+    try {
+      const d = await fetch('/api/status').then(r => r.json());
+      document.getElementById('ultima-actualizacion').textContent =
+        `actualizado ${timeAgo(d.ultima_actualizacion)}`;
+      document.getElementById('total-juegos').textContent =
+        `${d.total_juegos} juegos`;
+    } catch {}
+  }
+
+  // ─── Modal ───
+  async function openModal(id) {
+    const overlay = document.getElementById('modal-overlay');
+    overlay.classList.add('open');
+    document.getElementById('modal-body').innerHTML =
+      `<div style="text-align:center;padding:40px;color:var(--muted);font-family:var(--mono);font-size:.85rem">Cargando...</div>`;
+
+    try {
+      const j = await fetch(`/api/juegos/${id}`).then(r => r.json());
+
+      // Header
+      document.getElementById('modal-img').src   = j.imagen_url || '';
+      document.getElementById('modal-title').textContent = j.titulo;
+      document.getElementById('modal-platforms').innerHTML =
+        (j.consolas || []).map(p =>
+          `<span class="platform ${platformClass(p)}">${p}</span>`
+        ).join('');
+
+      // Precios
+      const preciosHtml = j.precios && j.precios.length
+        ? `<table class="prices-table">
+            <tr><th>Tienda</th><th>Precio</th><th>Regular</th><th>Link</th></tr>
+            ${j.precios.map(p => `
+              <tr>
+                <td><span class="store-name store-${p.tienda}">${p.tienda}</span>
+                    ${p.en_oferta ? '<span class="deal-badge">OFERTA</span>' : ''}
+                </td>
+                <td style="font-family:var(--mono);color:var(--amber)">${fmt(p.precio) ?? '—'}</td>
+                <td style="font-family:var(--mono);color:var(--muted);text-decoration:line-through">${fmt(p.precio_regular) ?? ''}</td>
+                <td>${p.url ? `<a class="store-link" href="${p.url}" target="_blank">Ver →</a>` : '—'}</td>
+              </tr>
+            `).join('')}
+          </table>`
+        : `<p style="color:var(--muted);font-size:.85rem">Sin precios registrados aún.</p>`;
+
+      // Scores
+      const scoresHtml = j.scores && j.scores.length
+        ? `<div class="scores-grid">
+            ${j.scores.map(s => `
+              <div class="score-chip">
+                <span class="score-num" style="color:${s.score_metacritic >= 75 ? 'var(--green)' : s.score_metacritic >= 50 ? 'var(--yellow)' : 'var(--red)'}">${s.score_metacritic ?? '—'}</span>
+                <span class="score-platform">${s.consola}</span>
+              </div>
+            `).join('')}
+          </div>`
+        : `<p style="color:var(--muted);font-size:.85rem">Sin scores registrados.</p>`;
+
+      // HLTB
+      const hltb = j.hltb;
+      const hltbHtml = hltb
+        ? `<div class="hltb-grid">
+            <div class="hltb-card">
+              <span class="hltb-hours">${hltb.horas_main ?? '—'}h</span>
+              <div class="hltb-label">Historia</div>
+            </div>
+            <div class="hltb-card">
+              <span class="hltb-hours">${hltb.horas_main_extra ?? '—'}h</span>
+              <div class="hltb-label">Historia + Extras</div>
+            </div>
+            <div class="hltb-card">
+              <span class="hltb-hours">${hltb.horas_completionist ?? '—'}h</span>
+              <div class="hltb-label">100%</div>
+            </div>
+          </div>`
+        : `<p style="color:var(--muted);font-size:.85rem">Sin datos de duración.</p>`;
+
+      document.getElementById('modal-body').innerHTML = `
+        <div class="modal-section"><h3>Precios</h3>${preciosHtml}</div>
+        <div class="modal-section"><h3>Score Metacritic</h3>${scoresHtml}</div>
+        <div class="modal-section"><h3>Duración (HowLongToBeat)</h3>${hltbHtml}</div>
+      `;
+    } catch {
+      document.getElementById('modal-body').innerHTML =
+        `<p style="color:var(--red);padding:20px">Error al cargar el detalle.</p>`;
+    }
+  }
+
+  function closeModal() {
+    document.getElementById('modal-overlay').classList.remove('open');
+  }
+
+  document.getElementById('modal-close').addEventListener('click', closeModal);
+  document.getElementById('modal-overlay').addEventListener('click', e => {
+    if (e.target === document.getElementById('modal-overlay')) closeModal();
+  });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+  // ─── Filtros eventos ───
+  document.getElementById('f-plataforma').addEventListener('change', e => {
+    state.plataforma = e.target.value;
+    cargarJuegos();
+  });
+
+  document.getElementById('f-tienda').addEventListener('change', e => {
+    state.tienda = e.target.value;
+    cargarJuegos();
+  });
+
+  document.getElementById('f-oferta').addEventListener('click', function() {
+    state.en_oferta = !state.en_oferta;
+    this.classList.toggle('active', state.en_oferta);
+    cargarJuegos();
+  });
+
+  document.getElementById('f-orden').addEventListener('change', e => {
+    state.orden = e.target.value;
+    cargarJuegos();
+  });
+
+  // ─── Arranque ───
+  cargarJuegos();
+  actualizarStatus();
+  setInterval(actualizarStatus, 60000);
+</script>
+</body>
+</html>

@@ -201,3 +201,94 @@ def loggear_fallo(juego_id: int | None, fuente: str, mensaje: str) -> None:
             INSERT INTO log_scraping (juego_id, fuente, nivel, mensaje)
             VALUES (%s, %s, 'ERROR', %s)
         """, (juego_id, fuente, mensaje))
+
+
+# =====================================================================
+# PARA LA API DE FELIPE
+# =====================================================================
+def obtener_lista_para_api(
+    plataforma: Optional[str] = None,
+    tienda: Optional[str] = None,
+    en_oferta: Optional[bool] = None,
+    orden: str = "nombre",
+    limit: int = 50,
+) -> list[dict]:
+    """
+    Para el endpoint GET /api/juegos.
+    Devuelve los juegos con su mejor precio y score, con filtros y ordenamiento.
+    Felipe llama a esta función desde FastAPI — no escribe SQL.
+    """
+    conditions = []
+    params: list = []
+
+    if plataforma:
+        conditions.append("%s = ANY(j.consolas)")
+        params.append(plataforma)
+
+    if tienda:
+        conditions.append(
+            "EXISTS(SELECT 1 FROM precios_actuales p2 "
+            "WHERE p2.juego_id = j.id AND p2.tienda = %s AND p2.precio IS NOT NULL)"
+        )
+        params.append(tienda)
+
+    if en_oferta is True:
+        conditions.append(
+            "EXISTS(SELECT 1 FROM precios_actuales p2 "
+            "WHERE p2.juego_id = j.id AND p2.en_oferta = true)"
+        )
+    elif en_oferta is False:
+        conditions.append(
+            "NOT EXISTS(SELECT 1 FROM precios_actuales p2 "
+            "WHERE p2.juego_id = j.id AND p2.en_oferta = true)"
+        )
+
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    order_map = {
+        "nombre":    "j.titulo ASC",
+        "precio":    "mejor_precio ASC NULLS LAST",
+        "descuento": "porcentaje_descuento DESC NULLS LAST",
+        "score":     "mejor_score DESC NULLS LAST",
+    }
+    order_by = order_map.get(orden, "j.titulo ASC")
+    params.append(limit)
+
+    query = f"""
+        SELECT
+            j.id,
+            j.titulo,
+            j.consolas,
+            j.imagen_url,
+            j.precio_sugerido::float                                      AS precio_sugerido,
+            MIN(p.precio)::float                                           AS mejor_precio,
+            MAX(s.score_metacritic)                                        AS mejor_score,
+            BOOL_OR(p.en_oferta)                                           AS en_oferta,
+            CASE
+                WHEN j.precio_sugerido > 0
+                     AND MIN(p.precio) IS NOT NULL
+                     AND MIN(p.precio) < j.precio_sugerido
+                THEN ROUND(
+                    (j.precio_sugerido - MIN(p.precio)) / j.precio_sugerido * 100, 2
+                )::float
+                ELSE NULL
+            END AS porcentaje_descuento
+        FROM juegos j
+        LEFT JOIN precios_actuales p ON p.juego_id = j.id
+        LEFT JOIN scores           s ON s.juego_id = j.id
+        {where_clause}
+        GROUP BY j.id, j.titulo, j.consolas, j.imagen_url, j.precio_sugerido
+        ORDER BY {order_by}
+        LIMIT %s
+    """
+
+    with _conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, params)
+        return [dict(row) for row in cur.fetchall()]
+
+
+def contar_juegos() -> int:
+    """Total de juegos en la BD. Para el endpoint /api/status."""
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM juegos")
+        return cur.fetchone()[0]
