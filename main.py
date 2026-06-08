@@ -7,21 +7,25 @@ Endpoints:
     GET /api/juegos/{id}     → detalle completo: precios, scores, HLTB
     GET /api/status          → última actualización y total de juegos
 
+Actualización automática:
+    APScheduler corre el orquestador completo cada 12 horas en segundo
+    plano. No es necesario ejecutar orquestador_brack.py manualmente.
+    Primera ejecución: 60 segundos después de levantar el servidor
+    (para que el servidor ya esté listo antes de arrancar el scraping).
+
 Docs automáticas (Swagger): http://localhost:8000/docs
-Para ingresar a la página principal del frontend: http://localhost:8000/
-
-
 Correr localmente:
     python main.py
-
 Para Render (producción):
     uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -29,23 +33,69 @@ from fastapi.staticfiles import StaticFiles
 
 import repository as repo
 
+log = logging.getLogger(__name__)
+
 FRONTEND_DIR = Path(__file__).parent / "frontend"
+
+
+# ─────────────────────────────────────────────────────────
+# Scheduler: scraping automático cada 12 horas
+# ─────────────────────────────────────────────────────────
+
+def _correr_scraping():
+    """
+    Función que el scheduler llama cada 12 h.
+    Importa el orquestador aquí para que FastAPI no lo cargue en el
+    arranque (evita que se conecte a Chrome/requests al iniciar).
+    """
+    try:
+        log.info("[Scheduler] Iniciando scraping automático...")
+        from orquestador_brack import ejecutar_scraping_completo
+        resultado = ejecutar_scraping_completo()
+        log.info(f"[Scheduler] Scraping terminado: {resultado}")
+    except Exception as e:
+        log.error(f"[Scheduler] Error en scraping automático: {e}")
+
+
+_scheduler = BackgroundScheduler()
+_scheduler.add_job(
+    _correr_scraping,
+    trigger="interval",
+    hours=12,
+    id="scraping_12h",
+    # Primera ejecución: 60 segundos después de levantar el servidor
+    next_run_time=None,   # se sobreescribe en lifespan
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Arranque
     repo.init_pool(minconn=2, maxconn=10)
+
+    import datetime
+    primera_ejecucion = datetime.datetime.now() + datetime.timedelta(seconds=60)
+    _scheduler.reschedule_job("scraping_12h", trigger="interval", hours=12,
+                               start_date=primera_ejecucion)
+    _scheduler.start()
+    log.info(f"[Scheduler] Próxima actualización: {primera_ejecucion.strftime('%H:%M:%S')}")
+
     yield
+
+    # Apagado limpio
+    _scheduler.shutdown(wait=False)
 
 
 app = FastAPI(
     title="Multicore Precios Juegos",
-    description="Precios de 200+ videojuegos en Steam y Nintendo eShop, con scores de Metacritic y tiempos de HowLongToBeat.",
+    description=(
+        "Precios de 200+ videojuegos en Steam y Nintendo eShop, "
+        "con scores de Metacritic y tiempos de HowLongToBeat."
+    ),
     version="1.0.0",
     lifespan=lifespan,
 )
 
-# CORS: necesario para que el frontend pueda llamar desde otro dominio en Render
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -60,21 +110,11 @@ app.add_middleware(
 
 @app.get("/api/juegos", summary="Lista de juegos con mejor precio")
 def get_juegos(
-    plataforma: Optional[str] = Query(
-        None, description="Switch | PS5 | PS4 | Xbox | PC"
-    ),
-    tienda: Optional[str] = Query(
-        None, description="steam | nintendo"
-    ),
-    en_oferta: Optional[bool] = Query(
-        None, description="true → solo ofertas"
-    ),
-    orden: str = Query(
-        "nombre", description="nombre | precio | descuento | score"
-    ),
-    limit: int = Query(
-        50, ge=1, le=200, description="Cantidad de resultados (máx 200)"
-    ),
+    plataforma: Optional[str] = Query(None, description="Switch | PS5 | PS4 | Xbox | PC"),
+    tienda:     Optional[str] = Query(None, description="steam | nintendo"),
+    en_oferta:  Optional[bool] = Query(None, description="true → solo ofertas"),
+    orden:      str           = Query("nombre", description="nombre | precio | descuento | score"),
+    limit:      int           = Query(50, ge=1, le=200, description="Máx 200"),
 ):
     juegos = repo.obtener_lista_para_api(
         plataforma=plataforma,
@@ -101,20 +141,18 @@ def get_juego(juego_id: int):
     if not juego:
         raise HTTPException(status_code=404, detail="Juego no encontrado")
 
-    precios  = repo.obtener_precios_por_juego(juego_id)
-    scores   = repo.obtener_scores_por_juego(juego_id)
-    hltb     = repo.obtener_hltb_por_juego(juego_id)
+    precios = repo.obtener_precios_por_juego(juego_id)
+    scores  = repo.obtener_scores_por_juego(juego_id)
+    hltb    = repo.obtener_hltb_por_juego(juego_id)
 
     urls_tiendas = juego.get("urls_tiendas") or {}
 
-    # Adjuntar URL de la tienda a cada precio
     precios_out = []
     for p in precios:
         d = dict(p)
         d["url"] = urls_tiendas.get(d["tienda"])
         if d.get("fecha_scraping"):
             d["fecha_scraping"] = d["fecha_scraping"].isoformat()
-        # Convertir Decimal a float
         for k in ("precio", "precio_regular", "porcentaje_descuento"):
             if d.get(k) is not None:
                 d[k] = float(d[k])
@@ -144,6 +182,7 @@ def get_juego(juego_id: int):
         "precios":         precios_out,
         "scores":          scores_out,
         "hltb":            hltb_out,
+        "urls_tiendas":    urls_tiendas,
     }
 
 
@@ -155,10 +194,13 @@ def get_juego(juego_id: int):
 def get_status():
     ultima = repo.ultima_actualizacion()
     total  = repo.contar_juegos()
+    proxima_job = _scheduler.get_job("scraping_12h")
+    proxima = proxima_job.next_run_time.isoformat() if proxima_job and proxima_job.next_run_time else None
     return {
-        "ultima_actualizacion": ultima.isoformat() if ultima else None,
-        "total_juegos":         total,
-        "scraping_en_curso":    False,
+        "ultima_actualizacion":  ultima.isoformat() if ultima else None,
+        "total_juegos":          total,
+        "scraping_en_curso":     False,
+        "proxima_actualizacion": proxima,
     }
 
 
@@ -180,4 +222,4 @@ def root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

@@ -16,15 +16,9 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 
-# =====================================================================
-# Conexión: pool de conexiones (thread-safe — clave para el paralelismo de Brack)
-# =====================================================================
-# Usar las credenciales de Supabase (vienen del .env, no hardcoded)
 import os
 from dotenv import load_dotenv
 
-# Carga el .env desde la misma carpeta donde está este archivo (repository.py)
-# Sin esto, load_dotenv() puede buscar en el directorio de trabajo incorrecto.
 _ENV_PATH = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH)
 
@@ -32,7 +26,6 @@ _pool: Optional[ThreadedConnectionPool] = None
 
 
 def init_pool(minconn: int = 2, maxconn: int = 20) -> None:
-    """Se llama UNA vez al inicio del programa."""
     global _pool
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
@@ -41,16 +34,11 @@ def init_pool(minconn: int = 2, maxconn: int = 20) -> None:
             f"Verifica que exista el archivo .env en: {_ENV_PATH}\n"
             "Contenido esperado: DATABASE_URL=postgresql://..."
         )
-    _pool = ThreadedConnectionPool(
-        minconn,
-        maxconn,
-        dsn=db_url,
-    )
+    _pool = ThreadedConnectionPool(minconn, maxconn, dsn=db_url)
 
 
 @contextmanager
 def _conn():
-    """Saca una conexión del pool, la devuelve al terminar."""
     if _pool is None:
         init_pool()
     conn = _pool.getconn()
@@ -65,10 +53,9 @@ def _conn():
 
 
 # =====================================================================
-# LECTURAS (las usa Brack para saber qué scrapear; las usa Felipe para la API)
+# LECTURAS
 # =====================================================================
 def obtener_todos_los_juegos() -> list[dict]:
-    """Devuelve todos los juegos con sus URLs de tiendas. Brack itera sobre esto."""
     with _conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             SELECT id, titulo, consolas, precio_sugerido,
@@ -87,7 +74,6 @@ def obtener_juego_por_id(juego_id: int) -> Optional[dict]:
 
 
 def obtener_precios_por_juego(juego_id: int) -> list[dict]:
-    """Para la vista de detalle. Felipe la llama."""
     with _conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             SELECT tienda, precio, precio_regular, en_oferta,
@@ -121,15 +107,13 @@ def obtener_hltb_por_juego(juego_id: int) -> Optional[dict]:
 
 
 def ultima_actualizacion() -> Optional[str]:
-    """Felipe la usa para mostrar 'Última actualización: hace X min'."""
     with _conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT MAX(fecha_scraping) FROM precios_actuales")
         return cur.fetchone()[0]
 
 
 # =====================================================================
-# ESCRITURAS (las usa Brack desde los scrapers, en paralelo)
-# Todas hacen UPSERT — no falla si ya existía
+# ESCRITURAS
 # =====================================================================
 def actualizar_precio(
     juego_id: int,
@@ -137,7 +121,6 @@ def actualizar_precio(
     precio: float,
     precio_regular: float | None = None,
 ) -> None:
-    """Brack la llama cada vez que un scraper de tienda termina con éxito."""
     en_oferta = False
     descuento = None
 
@@ -146,7 +129,7 @@ def actualizar_precio(
         row = cur.fetchone()
         sugerido = row[0] if row else None
 
-        if sugerido and precio < float(sugerido):
+        if sugerido and precio is not None and precio < float(sugerido):
             en_oferta = True
             descuento = round((float(sugerido) - precio) / float(sugerido) * 100, 2)
 
@@ -162,6 +145,21 @@ def actualizar_precio(
                 porcentaje_descuento = EXCLUDED.porcentaje_descuento,
                 fecha_scraping = NOW()
         """, (juego_id, tienda, precio, precio_regular, en_oferta, descuento))
+
+
+def actualizar_url_tienda(juego_id: int, tienda: str, url: str) -> None:
+    """
+    Guarda la URL directa de la tienda en juegos.urls_tiendas.
+    El scraper de Steam la llama cuando encuentra la URL /app/{id}/ real
+    en lugar de la URL de búsqueda que genera seeding.py.
+    """
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            UPDATE juegos
+            SET urls_tiendas = COALESCE(urls_tiendas, '{}'::jsonb)
+                               || jsonb_build_object(%s, %s)
+            WHERE id = %s
+        """, (tienda, url, juego_id))
 
 
 def guardar_score(juego_id: int, consola: str, score: int) -> None:
@@ -195,7 +193,6 @@ def guardar_hltb(
 
 
 def loggear_fallo(juego_id: int | None, fuente: str, mensaje: str) -> None:
-    """Brack la llama cuando un scraper falla, para que quede registro."""
     with _conn() as conn, conn.cursor() as cur:
         cur.execute("""
             INSERT INTO log_scraping (juego_id, fuente, nivel, mensaje)
@@ -213,11 +210,6 @@ def obtener_lista_para_api(
     orden: str = "nombre",
     limit: int = 50,
 ) -> list[dict]:
-    """
-    Para el endpoint GET /api/juegos.
-    Devuelve los juegos con su mejor precio y score, con filtros y ordenamiento.
-    Felipe llama a esta función desde FastAPI — no escribe SQL.
-    """
     conditions = []
     params: list = []
 
@@ -260,6 +252,7 @@ def obtener_lista_para_api(
             j.titulo,
             j.consolas,
             j.imagen_url,
+            j.urls_tiendas,
             j.precio_sugerido::float                                      AS precio_sugerido,
             MIN(p.precio)::float                                           AS mejor_precio,
             MAX(s.score_metacritic)                                        AS mejor_score,
@@ -277,7 +270,7 @@ def obtener_lista_para_api(
         LEFT JOIN precios_actuales p ON p.juego_id = j.id
         LEFT JOIN scores           s ON s.juego_id = j.id
         {where_clause}
-        GROUP BY j.id, j.titulo, j.consolas, j.imagen_url, j.precio_sugerido
+        GROUP BY j.id, j.titulo, j.consolas, j.imagen_url, j.urls_tiendas, j.precio_sugerido
         ORDER BY {order_by}
         LIMIT %s
     """
@@ -288,7 +281,6 @@ def obtener_lista_para_api(
 
 
 def contar_juegos() -> int:
-    """Total de juegos en la BD. Para el endpoint /api/status."""
     with _conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM juegos")
         return cur.fetchone()[0]
