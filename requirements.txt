@@ -5,7 +5,7 @@ python-dotenv==1.0.1
 # HTTP / scraping
 requests==2.32.3
 beautifulsoup4==4.12.3
-fake-useragent==1.5.1
+fake-useragent>=2.0.0
 
 # Backend FastAPI
 fastapi==0.115.0
