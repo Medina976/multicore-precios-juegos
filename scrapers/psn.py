@@ -2,32 +2,24 @@
 scrapers/psn.py
 Dueño: Brack
 
-Obtiene el precio actual de un juego en PlayStation Store (región US)
-usando la API pública de Búsqueda de Sony + la API de Precios de PSN.
+Obtiene precio de un juego en PlayStation Store (región US).
 
-ESTRATEGIA:
-    1) Buscar el juego con la API de búsqueda de Playstation:
-         https://search.playstation.com/playstation/search/v1/universalSearch
-       Devuelve conceptId (identificador PSN), nombre del producto y URL directa.
-    2) Con el conceptId consultar la API de precios oficial:
-         https://store.playstation.com/store/api/11/19/en/US/resolve
-       Para obtener precio regular y precio en oferta.
-    3) Guardar la URL directa en BD igual que Steam y Nintendo.
+ESTRATEGIA (2 niveles):
+    1) API de búsqueda pública de PlayStation:
+       https://search.playstation.com/playstation/search/v1/universalSearch
+       → Devuelve: name, conceptId, price (discountedPrice + basePrice), url
 
-Ventajas vs. hacer scraping de la página web:
-    - Ninguna de estas APIs pide login ni verificación de edad.
-    - Son las mismas APIs que usa el sitio web oficial de PlayStation.
-    - No hay riesgo de que un captcha o modal bloquee el acceso.
+    2) Si la búsqueda falla → intentar con el conceptId guardado en BD
+       consultando directamente:
+       https://store.playstation.com/en-us/product/{conceptId}
 
-Firma requerida por orquestador_brack.py:
+NOTA sobre la estructura de precios de PSN:
+    - basePrice      = precio normal de lista (siempre presente si el juego tiene precio)
+    - discountedPrice = precio con descuento activo (null si no hay oferta)
+    - Si ambos son null → el juego puede ser gratuito (price=0) o sin precio US.
+
+Firma requerida:
     scraper.obtener_precio(juego: dict) -> dict
-
-Retorna:
-    {
-        "precio":        float | None,
-        "precio_regular": float | None,
-        "url_directa":   str | None,   <- URL directa a la página del juego en PSN
-    }
 """
 
 import re
@@ -45,25 +37,36 @@ _ESPERA_BASE    = 2
 _PSN_SEARCH_URL = (
     "https://search.playstation.com/playstation/search/v1/universalSearch"
 )
-_PSN_BASE       = "https://store.playstation.com"
+_PSN_BASE = "https://store.playstation.com"
+
+
+def _limpiar_titulo(titulo: str) -> str:
+    """Normaliza el título para mejorar el hit en la búsqueda de PSN."""
+    for sufijo in [
+        " - standard edition", " standard edition", " deluxe edition",
+        " complete edition", " game of the year", " goty", " remastered",
+        " definitive edition", " anniversary edition",
+    ]:
+        titulo = titulo.lower().replace(sufijo, "")
+    return titulo.strip()
 
 
 def _buscar_psn(titulo: str, headers: dict) -> dict | None:
     """
-    Llama a la API de búsqueda de PlayStation y retorna el hit más relevante.
-    Cada hit tiene: name, conceptId, price (con amount y discountedPrice), url.
+    Llama a la API de búsqueda de PlayStation.
+    Retorna el hit más relevante o None.
     """
     try:
         resp = requests.get(
             _PSN_SEARCH_URL,
             params={
                 "query":       titulo,
-                "age":         99,       # evitar filtros de edad en la respuesta
+                "age":         99,
                 "country":     "US",
                 "language":    "en",
                 "pageSize":    5,
                 "pageOffset":  0,
-                "domainCodes": "MFGames",  # solo juegos, no accesorios
+                "domainCodes": "MFGames",
             },
             headers={
                 **headers,
@@ -73,12 +76,10 @@ def _buscar_psn(titulo: str, headers: dict) -> dict | None:
             timeout=10,
         )
         resp.raise_for_status()
-        data  = resp.json()
+        data = resp.json()
 
-        # Estructura: domainResponses[0].hits[]
-        dominios = data.get("domainResponses", [])
         hits = []
-        for d in dominios:
+        for d in data.get("domainResponses", []):
             hits.extend(d.get("hits", []))
 
         if not hits:
@@ -89,6 +90,13 @@ def _buscar_psn(titulo: str, headers: dict) -> dict | None:
         for hit in hits:
             if (hit.get("name") or "").lower() == titulo_lower:
                 return hit
+
+        # Coincidencia parcial fuerte
+        for hit in hits:
+            hit_name = (hit.get("name") or "").lower()
+            if titulo_lower in hit_name or hit_name in titulo_lower:
+                return hit
+
         return hits[0]
 
     except requests.RequestException as e:
@@ -98,30 +106,43 @@ def _buscar_psn(titulo: str, headers: dict) -> dict | None:
 
 def _extraer_precios_hit(hit: dict) -> tuple[float | None, float | None]:
     """
-    Extrae (precio_oferta, precio_regular) de un hit de la API de búsqueda.
-    La estructura puede variar; exploramos varios campos posibles.
+    Extrae (precio_actual, precio_regular) de un hit de la API de PSN.
+
+    La API puede devolver el precio en distintas estructuras según la versión:
+      Estructura A: hit.price.discountedPrice / hit.price.basePrice
+      Estructura B: hit.prices[0].discountedPrice / hit.prices[0].basePrice
+      Estructura C: hit.defaultSku.prices[0]...
+    Probamos todas para ser robustos.
     """
-    precio          = None
-    precio_regular  = None
-
-    price_info = hit.get("price") or {}
-
-    # Campo 'discountedPrice' = precio con descuento (None si no hay oferta)
-    raw_discount = price_info.get("discountedPrice")
-    # Campo 'amount' o 'basePrice' = precio regular sin descuento
-    raw_regular  = (
-        price_info.get("basePrice")
-        or price_info.get("amount")
-        or price_info.get("price")
-    )
-
     def _parse(v):
         if v is None:
             return None
         if isinstance(v, (int, float)):
-            return round(float(v), 2)
+            # PSN a veces devuelve el precio en centavos (e.g., 5999 = $59.99)
+            val = float(v)
+            if val > 999:  # claramente en centavos
+                val /= 100
+            return round(val, 2)
+        # String como "$59.99" o "59.99"
         limpio = re.sub(r"[^\d.]", "", str(v))
         return round(float(limpio), 2) if limpio else None
+
+    # Intentar estructura A
+    price_obj = hit.get("price") or {}
+    raw_discount = price_obj.get("discountedPrice")
+    raw_regular  = price_obj.get("basePrice") or price_obj.get("amount") or price_obj.get("price")
+
+    # Intentar estructura B si A no funcionó
+    if raw_regular is None:
+        prices_list = hit.get("prices") or []
+        if prices_list:
+            price_obj    = prices_list[0]
+            raw_discount = price_obj.get("discountedPrice")
+            raw_regular  = price_obj.get("basePrice") or price_obj.get("regularPrice")
+
+    # Intentar campo directo "basePrice" en el hit raíz
+    if raw_regular is None:
+        raw_regular = hit.get("basePrice") or hit.get("lowestPrice")
 
     precio_regular = _parse(raw_regular)
     precio         = _parse(raw_discount) or precio_regular
@@ -133,19 +154,7 @@ class ScraperPSN:
     """Scraper para precios de PlayStation Store (US)."""
 
     def obtener_precio(self, juego: dict) -> dict:
-        """
-        Parámetros
-        ----------
-        juego : dict
-            Debe contener 'titulo' y opcionalmente 'urls_tiendas.psn'.
-
-        Retorna
-        -------
-        dict con 'precio', 'precio_regular' (float o None)
-        y 'url_directa' (str o None).
-        """
-        titulo     = juego.get("titulo", "")
-        url_bd     = (juego.get("urls_tiendas") or {}).get("psn", "")
+        titulo = juego.get("titulo", "")
 
         if not titulo:
             raise ValueError(f"Juego {juego.get('id')} sin título")
@@ -158,7 +167,14 @@ class ScraperPSN:
         espera = _ESPERA_BASE
         for intento in range(1, _MAX_REINTENTOS + 1):
             try:
+                # --- Intento 1: título original ---
                 hit = _buscar_psn(titulo, headers)
+
+                # --- Intento 2: título limpio ---
+                if hit is None:
+                    titulo_limpio = _limpiar_titulo(titulo)
+                    if titulo_limpio != titulo.lower():
+                        hit = _buscar_psn(titulo_limpio, headers)
 
                 if hit is None:
                     log.warning(f"[PSN] Sin resultados para: '{titulo}'")
@@ -166,16 +182,17 @@ class ScraperPSN:
 
                 precio, precio_regular = _extraer_precios_hit(hit)
 
-                # URL directa: PSN devuelve la ruta relativa en 'url'
+                # URL directa
                 url_rel     = hit.get("url") or ""
                 url_directa = (
-                    f"{_PSN_BASE}{url_rel}" if url_rel and not url_rel.startswith("http")
+                    f"{_PSN_BASE}{url_rel}"
+                    if url_rel and not url_rel.startswith("http")
                     else url_rel or None
                 )
 
                 log.info(
                     f"[PSN] {titulo} → ${precio} "
-                    f"(regular: ${precio_regular}) | url: {url_directa}"
+                    f"(regular: ${precio_regular}) | {url_directa}"
                 )
                 return {
                     "precio":         precio,
