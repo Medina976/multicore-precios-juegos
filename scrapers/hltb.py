@@ -2,175 +2,82 @@
 scrapers/hltb.py
 Dueño: Brack
 
-Obtiene los tiempos de completado de un juego desde HowLongToBeat.
+Obtiene los tiempos de completado de un juego desde HowLongToBeat
+usando la librería oficial `howlongtobeatpy`.
 
-ESTRATEGIA:
-    HowLongToBeat no tiene API pública, pero expone un endpoint de búsqueda
-    que usa la propia web:
+https://pypi.org/project/howlongtobeatpy/
 
-    POST https://howlongtobeat.com/api/search/{token}
-    Body (JSON):
-      {
-        "searchType": "games",
-        "searchTerms": ["doom", "eternal"],
-        "searchPage": 1,
-        "size": 5,
-        "searchOptions": {
-          "games": {"userId": 0, "platform": "", ...},
-          "users": {"sortCategory": "postcount"},
-          "filter": "",
-          "sort": 0,
-          "randomizer": 0
-        }
-      }
+Ventajas sobre scraping manual:
+    - Maneja automáticamente el token dinámico de la API de HLTB
+      (que cambia con cada deploy de la página).
+    - Devuelve los tiempos ya en HORAS (no en segundos).
+    - Mantenida activamente; si HLTB cambia su API, se actualiza la librería.
 
-    El token se extrae del HTML de la página principal (cambia con deploys).
-    Respuesta: lista de juegos con comp_main, comp_plus, comp_100 en segundos.
-
-Firma requerida:
+Firma requerida por orquestador_brack.py:
     scraper.obtener_datos(juego: dict) -> dict
 
 Retorna:
     {
-        "main":          float | None,   (horas, redondeado 1 decimal)
+        "main":          float | None,   (horas, 1 decimal)
         "main_extra":    float | None,
         "completionist": float | None,
     }
 """
 
-import re
-import time
+import asyncio
 import logging
-import requests
-from fake_useragent import UserAgent
+import time
+from howlongtobeatpy import HowLongToBeat
 
 log = logging.getLogger(__name__)
 
-_ua = UserAgent()
 _MAX_REINTENTOS = 3
 _ESPERA_BASE    = 2
 
-_HLTB_BASE   = "https://howlongtobeat.com"
-_HLTB_SEARCH = "{base}/api/search/{token}"
 
-# Caché del token (se renueva si la respuesta da 404/403)
-_token_cache: str | None = None
+def _redondear(valor) -> float | None:
+    """Redondea a 1 decimal; retorna None si el valor es 0 o nulo."""
+    if valor is None or not isinstance(valor, (int, float)) or valor <= 0:
+        return None
+    return round(float(valor), 1)
 
 
-def _obtener_token() -> str:
+def _buscar_sincrono(titulo: str):
     """
-    Extrae el token de búsqueda del JS de la página de HLTB.
-    El token es un hash que aparece en el bundle JS de Next.js:
-      /api/search/<hash>
-    Estrategia: buscar en el HTML el patrón /api/search/[a-f0-9]+
+    howlongtobeatpy es async internamente; lo envolvemos en asyncio.run()
+    para que el orquestador (que usa threads, no async) pueda llamarlo.
     """
-    global _token_cache
-
-    resp = requests.get(
-        _HLTB_BASE,
-        headers={
-            "User-Agent": _ua.random,
-            "Accept": "text/html,application/xhtml+xml,*/*",
-        },
-        timeout=12,
-    )
-    resp.raise_for_status()
-
-    # Buscar el src del bundle JS principal de Next.js
-    js_srcs = re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', resp.text)
-
-    # Revisar los primeros archivos JS hasta encontrar el token
-    for src in js_srcs[:8]:
-        try:
-            js_resp = requests.get(
-                f"{_HLTB_BASE}{src}",
-                headers={"User-Agent": _ua.random},
-                timeout=10,
-            )
-            # El token aparece como: "/api/search/" + "<hash>"
-            # o como: fetch("/api/search/<hash>"
-            m = re.search(
-                r'["\x60]/api/search/([a-zA-Z0-9]{8,})["\x60/]',
-                js_resp.text,
-            )
-            if m:
-                _token_cache = m.group(1)
-                log.debug(f"[HLTB] Token encontrado: {_token_cache}")
-                return _token_cache
-        except requests.RequestException:
-            continue
-
-    raise RuntimeError("[HLTB] No se pudo extraer el token de búsqueda")
+    return asyncio.run(HowLongToBeat().async_search(titulo))
 
 
-def _buscar_hltb(titulo: str, token: str) -> dict | None:
+def _seleccionar_resultado(resultados: list, titulo: str) -> object | None:
     """
-    Hace POST a la API de búsqueda de HLTB.
-    Retorna el juego más relevante o None.
+    Elige el resultado más relevante de la lista que devuelve HLTB.
+    La librería ya los ordena por similitud, pero verificamos
+    coincidencia exacta primero.
     """
-    palabras = titulo.split()
-    payload = {
-        "searchType":  "games",
-        "searchTerms": palabras,
-        "searchPage":  1,
-        "size":        5,
-        "searchOptions": {
-            "games": {
-                "userId":       0,
-                "platform":     "",
-                "sortCategory": "popular",
-                "rangeCategory": "main",
-                "rangeTime":    {"min": None, "max": None},
-                "gameplay":     {"perspective": "", "flow": "", "genre": "", "subGenre": ""},
-                "rangeYear":    {"min": "", "max": ""},
-                "modifier":     "",
-            },
-            "users":  {"sortCategory": "postcount"},
-            "lists":  {"sortCategory": "follows"},
-            "filter": "",
-            "sort":   0,
-            "randomizer": 0,
-        },
-    }
-    resp = requests.post(
-        _HLTB_SEARCH.format(base=_HLTB_BASE, token=token),
-        json=payload,
-        headers={
-            "User-Agent":   _ua.random,
-            "Content-Type": "application/json",
-            "Origin":       _HLTB_BASE,
-            "Referer":      f"{_HLTB_BASE}/",
-        },
-        timeout=12,
-    )
-    resp.raise_for_status()
-
-    data    = resp.json()
-    results = data.get("data") or []
-    if not results:
+    if not resultados:
         return None
 
-    # Preferir coincidencia exacta de nombre
     titulo_lower = titulo.lower()
-    for r in results:
-        if (r.get("game_name") or "").lower() == titulo_lower:
+
+    # 1) Coincidencia exacta de nombre
+    for r in resultados:
+        if (r.game_name or "").lower() == titulo_lower:
             return r
 
-    # Coincidencia parcial fuerte
-    for r in results:
-        nombre = (r.get("game_name") or "").lower()
+    # 2) El mejor score de similaridad que devuelve la librería
+    #    (similarity es float 0-1; ya vienen ordenados de mayor a menor)
+    if hasattr(resultados[0], "similarity") and resultados[0].similarity >= 0.7:
+        return resultados[0]
+
+    # 3) Coincidencia parcial fuerte
+    for r in resultados:
+        nombre = (r.game_name or "").lower()
         if titulo_lower in nombre or nombre in titulo_lower:
             return r
 
-    return results[0]
-
-
-def _segundos_a_horas(segundos) -> float | None:
-    """Convierte segundos (int) a horas con 1 decimal. 0 → None."""
-    if not segundos or not isinstance(segundos, (int, float)):
-        return None
-    horas = segundos / 3600
-    return round(horas, 1) if horas > 0 else None
+    return resultados[0]
 
 
 class ScraperHLTB:
@@ -182,27 +89,33 @@ class ScraperHLTB:
         if not titulo:
             raise ValueError(f"Juego {juego.get('id')} sin título")
 
-        global _token_cache
+        vacio = {"main": None, "main_extra": None, "completionist": None}
         espera = _ESPERA_BASE
 
         for intento in range(1, _MAX_REINTENTOS + 1):
             try:
-                # Obtener o reutilizar el token
-                if _token_cache is None:
-                    _token_cache = _obtener_token()
+                resultados = _buscar_sincrono(titulo)
 
-                resultado = _buscar_hltb(titulo, _token_cache)
+                if not resultados:
+                    # Reintentar con título simplificado (sin subtítulos)
+                    titulo_corto = titulo.split(":")[0].split(" - ")[0].strip()
+                    if titulo_corto != titulo:
+                        resultados = _buscar_sincrono(titulo_corto)
 
-                if resultado is None:
+                if not resultados:
                     log.warning(f"[HLTB] Sin resultados para: '{titulo}'")
-                    return {"main": None, "main_extra": None, "completionist": None}
+                    return vacio
 
-                main          = _segundos_a_horas(resultado.get("comp_main"))
-                main_extra    = _segundos_a_horas(resultado.get("comp_plus"))
-                completionist = _segundos_a_horas(resultado.get("comp_100"))
+                juego_hltb = _seleccionar_resultado(resultados, titulo)
+                if juego_hltb is None:
+                    return vacio
+
+                main          = _redondear(juego_hltb.main_story)
+                main_extra    = _redondear(juego_hltb.main_extra)
+                completionist = _redondear(juego_hltb.completionist)
 
                 log.info(
-                    f"[HLTB] {titulo} → "
+                    f"[HLTB] {titulo} ({juego_hltb.game_name}) → "
                     f"Main: {main}h | Main+Extra: {main_extra}h | 100%%: {completionist}h"
                 )
                 return {
@@ -210,21 +123,6 @@ class ScraperHLTB:
                     "main_extra":    main_extra,
                     "completionist": completionist,
                 }
-
-            except requests.HTTPError as e:
-                # Si el token expiró, renovarlo en el siguiente intento
-                if e.response is not None and e.response.status_code in (403, 404):
-                    log.warning("[HLTB] Token expirado, renovando...")
-                    _token_cache = None
-                    time.sleep(espera)
-                    espera *= 2
-                else:
-                    log.warning(f"[HLTB] HTTP {e.response.status_code} para '{titulo}'")
-                    if intento < _MAX_REINTENTOS:
-                        time.sleep(espera)
-                        espera *= 2
-                    else:
-                        return {"main": None, "main_extra": None, "completionist": None}
 
             except Exception as e:
                 log.warning(
@@ -235,6 +133,6 @@ class ScraperHLTB:
                     time.sleep(espera)
                     espera *= 2
                 else:
-                    return {"main": None, "main_extra": None, "completionist": None}
+                    return vacio
 
-        return {"main": None, "main_extra": None, "completionist": None}
+        return vacio

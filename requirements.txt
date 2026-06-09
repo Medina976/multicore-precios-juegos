@@ -7,9 +7,12 @@ requests==2.32.3
 beautifulsoup4==4.12.3
 fake-useragent==1.5.1
 
+# HowLongToBeat (API oficial)
+howlongtobeatpy==1.0.1
+
 # Backend FastAPI
 fastapi==0.115.0
 uvicorn==0.30.6
 
-# Scheduler (para correr el scraping periódico cada 12 horas desde main.py)
+# Scheduler (scraping periódico cada 12 horas)
 apscheduler==3.10.4
