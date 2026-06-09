@@ -9,14 +9,16 @@ ESQUEMA VISUAL:
                 ├─ Tarea: Metacritic    (Nivel 2)
                 ├─ Tarea: HowLongToBeat (Nivel 2)
                 ├─ Tarea: Steam         (Nivel 3)
-                └─ Tarea: Nintendo eShop (Nivel 3)
+                ├─ Tarea: Nintendo eShop (Nivel 3)
+                ├─ Tarea: PSN            (Nivel 3)
+                └─ Tarea: Amazon         (Nivel 3)
             Esperar a que todas terminen, guardar en BD, siguiente juego.
 
-Uso desde linea de comandos:
-    python orquestador_brack.py                  # paralelo (default)
+Uso desde línea de comandos:
+    python orquestador_brack.py                   # paralelo (default)
     python orquestador_brack.py --modo secuencial  # secuencial
     python orquestador_brack.py --modo comparar    # corre ambos y muestra speedup
-    python orquestador_brack.py --limite 30      # solo 30 juegos (para pruebas)
+    python orquestador_brack.py --limite 30        # solo 30 juegos (para pruebas)
 
 Para mediciones DETALLADAS con reporte para el informe, ver:
     python medir_speedup.py
@@ -40,18 +42,25 @@ from repository import (
 )
 from scrapers.steam import ScraperSteam
 from scrapers.nintendo import ScraperNintendo
+from scrapers.psn import ScraperPSN
+from scrapers.amazon import ScraperAmazon
 from scrapers.metacritic import ScraperMetacritic
 from scrapers.hltb import ScraperHLTB
 
 
-# Configuracion
+# Configuración
 WORKERS_JUEGOS  = 10
-WORKERS_FUENTES = 6
+WORKERS_FUENTES = 8   # subido a 8 para cubrir las 6 fuentes en paralelo
 TIMEOUT_SEGUNDOS = 10
 
+# Tiendas: solo se ejecutan si el juego tiene URL configurada para esa tienda
+# (PSN y Amazon se añaden aquí; el seeding puede no tener sus URLs aún,
+# pero los scrapers las buscan por título y las guardan en BD automáticamente)
 FUENTES_TIENDAS = [
     ("steam",    ScraperSteam()),
     ("nintendo", ScraperNintendo()),
+    ("psn",      ScraperPSN()),
+    ("amazon",   ScraperAmazon()),
 ]
 FUENTES_AUXILIARES = [
     ("metacritic", ScraperMetacritic()),
@@ -66,16 +75,17 @@ log = logging.getLogger(__name__)
 
 
 def _guardar_resultado(juego_id: int, fuente: str, resultado: dict) -> None:
-    if fuente in ("steam", "nintendo", "psn"):
+    """Despacha el resultado a la función correcta de repository.py."""
+    if fuente in ("steam", "nintendo", "psn", "amazon"):
         actualizar_precio(
             juego_id,
             fuente,
             resultado.get("precio"),
             resultado.get("precio_regular"),
         )
-        # Si el scraper de Steam nos dio la URL directa, actualizarla en BD
-        if fuente == "steam" and resultado.get("url_directa"):
-            actualizar_url_tienda(juego_id, "steam", resultado["url_directa"])
+        # Si el scraper encontró la URL directa del producto, guardarla en BD
+        if resultado.get("url_directa"):
+            actualizar_url_tienda(juego_id, fuente, resultado["url_directa"])
 
     elif fuente == "metacritic":
         for consola, score in (resultado.get("scores") or {}).items():
@@ -92,6 +102,11 @@ def _guardar_resultado(juego_id: int, fuente: str, resultado: dict) -> None:
 
 
 def procesar_juego(juego: dict) -> None:
+    """
+    Lanza todas las fuentes de un juego en paralelo y guarda los resultados.
+    PSN y Amazon se lanzan siempre (no necesitan URL previa en BD,
+    los scrapers buscan por título y guardan la URL al encontrarla).
+    """
     juego_id = juego["id"]
     log.info(f"→ Juego {juego_id} ({juego['titulo']})")
 
@@ -103,7 +118,9 @@ def procesar_juego(juego: dict) -> None:
 
         for nombre, scraper in FUENTES_TIENDAS:
             url = (juego.get("urls_tiendas") or {}).get(nombre)
-            if url:
+            # Steam y Nintendo solo si tienen URL en BD
+            # PSN y Amazon: siempre (buscan por título)
+            if url or nombre in ("psn", "amazon"):
                 futuros[executor.submit(scraper.obtener_precio, juego)] = nombre
 
         for nombre, scraper in FUENTES_AUXILIARES:
@@ -115,7 +132,7 @@ def procesar_juego(juego: dict) -> None:
                 resultado = fut.result(timeout=TIMEOUT_SEGUNDOS)
                 _guardar_resultado(juego_id, nombre, resultado)
             except Exception as e:
-                log.warning(f"  ✗ {nombre} fallo para juego {juego_id}: {e}")
+                log.warning(f"  ✗ {nombre} falló para juego {juego_id}: {e}")
                 loggear_fallo(juego_id, nombre, str(e))
 
 
@@ -125,9 +142,9 @@ def ejecutar_scraping_completo(juegos: list[dict] | None = None) -> dict:
         juegos = obtener_todos_los_juegos()
     log.info(f"Iniciando scraping de {len(juegos)} juegos con {WORKERS_JUEGOS} workers")
 
-    inicio = time.perf_counter()
+    inicio   = time.perf_counter()
     exitosos = 0
-    fallidos  = 0
+    fallidos = 0
 
     with ThreadPoolExecutor(
         max_workers=WORKERS_JUEGOS,
@@ -141,15 +158,15 @@ def ejecutar_scraping_completo(juegos: list[dict] | None = None) -> dict:
                 exitosos += 1
             except Exception as e:
                 fallidos += 1
-                log.error(f"Juego {juego_id} fallo completamente: {e}")
+                log.error(f"Juego {juego_id} falló completamente: {e}")
 
     duracion = time.perf_counter() - inicio
     log.info(f"=== PARALELO Terminado: {exitosos} OK, {fallidos} fallos en {duracion:.1f}s ===")
     return {
-        "modo":               "paralelo",
-        "juegos_procesados":  exitosos,
-        "fallos":             fallidos,
-        "duracion_segundos":  round(duracion, 1),
+        "modo":              "paralelo",
+        "juegos_procesados": exitosos,
+        "fallos":            fallidos,
+        "duracion_segundos": round(duracion, 1),
     }
 
 
@@ -159,15 +176,15 @@ def ejecutar_scraping_secuencial(juegos: list[dict] | None = None) -> dict:
         juegos = obtener_todos_los_juegos()
     log.info(f"Iniciando scraping SECUENCIAL de {len(juegos)} juegos")
 
-    inicio = time.perf_counter()
+    inicio   = time.perf_counter()
     exitosos = 0
-    fallidos  = 0
+    fallidos = 0
 
     for juego in juegos:
         try:
             for nombre, scraper in FUENTES_TIENDAS:
                 url = (juego.get("urls_tiendas") or {}).get(nombre)
-                if url:
+                if url or nombre in ("psn", "amazon"):
                     try:
                         r = scraper.obtener_precio(juego)
                         _guardar_resultado(juego["id"], nombre, r)
@@ -184,21 +201,17 @@ def ejecutar_scraping_secuencial(juegos: list[dict] | None = None) -> dict:
             exitosos += 1
         except Exception as e:
             fallidos += 1
-            log.error(f"Juego {juego['id']} fallo completamente: {e}")
+            log.error(f"Juego {juego['id']} falló completamente: {e}")
 
     duracion = time.perf_counter() - inicio
     log.info(f"=== SECUENCIAL Terminado: {exitosos} OK, {fallidos} fallos en {duracion:.1f}s ===")
     return {
-        "modo":               "secuencial",
-        "juegos_procesados":  exitosos,
-        "fallos":             fallidos,
-        "duracion_segundos":  round(duracion, 1),
+        "modo":              "secuencial",
+        "juegos_procesados": exitosos,
+        "fallos":            fallidos,
+        "duracion_segundos": round(duracion, 1),
     }
 
-
-# =====================================================================
-# CLI
-# =====================================================================
 
 def main():
     init_pool()
@@ -218,7 +231,7 @@ def main():
 
     juegos = obtener_todos_los_juegos()
     if args.limite:
-        juegos = juegos[: args.limite]
+        juegos = juegos[:args.limite]
 
     if args.modo == "paralelo":
         ejecutar_scraping_completo(juegos)
