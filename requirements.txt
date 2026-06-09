@@ -5,10 +5,7 @@ python-dotenv==1.0.1
 # HTTP / scraping
 requests==2.32.3
 beautifulsoup4==4.12.3
-fake-useragent>=0.1.11          # sin fijar version exacta; howlongtobeatpy necesita >=0.1.11
-
-# HowLongToBeat (API oficial)
-howlongtobeatpy==1.0.1
+fake-useragent==1.5.1
 
 # Backend FastAPI
 fastapi==0.115.0

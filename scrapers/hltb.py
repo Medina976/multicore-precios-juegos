@@ -2,82 +2,167 @@
 scrapers/hltb.py
 Dueño: Brack
 
-Obtiene los tiempos de completado de un juego desde HowLongToBeat
-usando la librería oficial `howlongtobeatpy`.
+Obtiene los tiempos de completado de un juego desde HowLongToBeat.
 
-https://pypi.org/project/howlongtobeatpy/
+ESTRATEGIA:
+    HowLongToBeat no tiene API pública, pero expone un endpoint de búsqueda
+    que usa la propia web:
 
-Ventajas sobre scraping manual:
-    - Maneja automáticamente el token dinámico de la API de HLTB
-      (que cambia con cada deploy de la página).
-    - Devuelve los tiempos ya en HORAS (no en segundos).
-    - Mantenida activamente; si HLTB cambia su API, se actualiza la librería.
+    POST https://howlongtobeat.com/api/search/{token}
+    Body (JSON):
+      {
+        "searchType": "games",
+        "searchTerms": ["doom", "eternal"],
+        "searchPage": 1,
+        "size": 5,
+        "searchOptions": { ... }
+      }
 
-Firma requerida por orquestador_brack.py:
+    El token se extrae del HTML/JS de la página principal (cambia con deploys).
+    Respuesta: lista de juegos con comp_main, comp_plus, comp_100 en segundos.
+
+Firma requerida:
     scraper.obtener_datos(juego: dict) -> dict
 
 Retorna:
     {
-        "main":          float | None,   (horas, 1 decimal)
+        "main":          float | None,   (horas, redondeado 1 decimal)
         "main_extra":    float | None,
         "completionist": float | None,
     }
 """
 
-import asyncio
-import logging
+import re
 import time
-from howlongtobeatpy import HowLongToBeat
+import logging
+import requests
+from fake_useragent import UserAgent
 
 log = logging.getLogger(__name__)
 
+_ua = UserAgent()
 _MAX_REINTENTOS = 3
 _ESPERA_BASE    = 2
 
+_HLTB_BASE   = "https://howlongtobeat.com"
+_HLTB_SEARCH = "{base}/api/search/{token}"
 
-def _redondear(valor) -> float | None:
-    """Redondea a 1 decimal; retorna None si el valor es 0 o nulo."""
-    if valor is None or not isinstance(valor, (int, float)) or valor <= 0:
+# Cache del token (se renueva si la respuesta da 404/403)
+_token_cache: str | None = None
+
+
+def _obtener_token() -> str:
+    """
+    Extrae el token de busqueda del JS de la pagina de HLTB.
+    El token es un hash que aparece en el bundle JS de Next.js:
+      /api/search/<hash>
+    """
+    global _token_cache
+
+    resp = requests.get(
+        _HLTB_BASE,
+        headers={
+            "User-Agent": _ua.random,
+            "Accept": "text/html,application/xhtml+xml,*/*",
+        },
+        timeout=12,
+    )
+    resp.raise_for_status()
+
+    # Buscar el src del bundle JS principal de Next.js
+    js_srcs = re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', resp.text)
+
+    # Revisar los primeros archivos JS hasta encontrar el token
+    for src in js_srcs[:8]:
+        try:
+            js_resp = requests.get(
+                f"{_HLTB_BASE}{src}",
+                headers={"User-Agent": _ua.random},
+                timeout=10,
+            )
+            # El token aparece como: "/api/search/" + "<hash>"
+            m = re.search(
+                r'["\x60]/api/search/([a-zA-Z0-9]{8,})["\x60/]',
+                js_resp.text,
+            )
+            if m:
+                _token_cache = m.group(1)
+                log.debug(f"[HLTB] Token encontrado: {_token_cache}")
+                return _token_cache
+        except requests.RequestException:
+            continue
+
+    raise RuntimeError("[HLTB] No se pudo extraer el token de busqueda")
+
+
+def _buscar_hltb(titulo: str, token: str) -> dict | None:
+    """
+    Hace POST a la API de busqueda de HLTB.
+    Retorna el juego mas relevante o None.
+    """
+    palabras = titulo.split()
+    payload = {
+        "searchType":  "games",
+        "searchTerms": palabras,
+        "searchPage":  1,
+        "size":        5,
+        "searchOptions": {
+            "games": {
+                "userId":        0,
+                "platform":      "",
+                "sortCategory":  "popular",
+                "rangeCategory": "main",
+                "rangeTime":     {"min": None, "max": None},
+                "gameplay":      {"perspective": "", "flow": "", "genre": "", "subGenre": ""},
+                "rangeYear":     {"min": "", "max": ""},
+                "modifier":      "",
+            },
+            "users":  {"sortCategory": "postcount"},
+            "lists":  {"sortCategory": "follows"},
+            "filter": "",
+            "sort":   0,
+            "randomizer": 0,
+        },
+    }
+    resp = requests.post(
+        _HLTB_SEARCH.format(base=_HLTB_BASE, token=token),
+        json=payload,
+        headers={
+            "User-Agent":   _ua.random,
+            "Content-Type": "application/json",
+            "Origin":       _HLTB_BASE,
+            "Referer":      f"{_HLTB_BASE}/",
+        },
+        timeout=12,
+    )
+    resp.raise_for_status()
+
+    data    = resp.json()
+    results = data.get("data") or []
+    if not results:
         return None
-    return round(float(valor), 1)
 
-
-def _buscar_sincrono(titulo: str):
-    """
-    howlongtobeatpy es async internamente; lo envolvemos en asyncio.run()
-    para que el orquestador (que usa threads, no async) pueda llamarlo.
-    """
-    return asyncio.run(HowLongToBeat().async_search(titulo))
-
-
-def _seleccionar_resultado(resultados: list, titulo: str) -> object | None:
-    """
-    Elige el resultado más relevante de la lista que devuelve HLTB.
-    La librería ya los ordena por similitud, pero verificamos
-    coincidencia exacta primero.
-    """
-    if not resultados:
-        return None
-
+    # Preferir coincidencia exacta de nombre
     titulo_lower = titulo.lower()
-
-    # 1) Coincidencia exacta de nombre
-    for r in resultados:
-        if (r.game_name or "").lower() == titulo_lower:
+    for r in results:
+        if (r.get("game_name") or "").lower() == titulo_lower:
             return r
 
-    # 2) El mejor score de similaridad que devuelve la librería
-    #    (similarity es float 0-1; ya vienen ordenados de mayor a menor)
-    if hasattr(resultados[0], "similarity") and resultados[0].similarity >= 0.7:
-        return resultados[0]
-
-    # 3) Coincidencia parcial fuerte
-    for r in resultados:
-        nombre = (r.game_name or "").lower()
+    # Coincidencia parcial fuerte
+    for r in results:
+        nombre = (r.get("game_name") or "").lower()
         if titulo_lower in nombre or nombre in titulo_lower:
             return r
 
-    return resultados[0]
+    return results[0]
+
+
+def _segundos_a_horas(segundos) -> float | None:
+    """Convierte segundos (int) a horas con 1 decimal. 0 -> None."""
+    if not segundos or not isinstance(segundos, (int, float)):
+        return None
+    horas = segundos / 3600
+    return round(horas, 1) if horas > 0 else None
 
 
 class ScraperHLTB:
@@ -87,36 +172,37 @@ class ScraperHLTB:
         titulo = juego.get("titulo", "")
 
         if not titulo:
-            raise ValueError(f"Juego {juego.get('id')} sin título")
+            raise ValueError(f"Juego {juego.get('id')} sin titulo")
 
-        vacio = {"main": None, "main_extra": None, "completionist": None}
+        global _token_cache
+        vacio  = {"main": None, "main_extra": None, "completionist": None}
         espera = _ESPERA_BASE
 
         for intento in range(1, _MAX_REINTENTOS + 1):
             try:
-                resultados = _buscar_sincrono(titulo)
+                # Obtener o reutilizar el token
+                if _token_cache is None:
+                    _token_cache = _obtener_token()
 
-                if not resultados:
-                    # Reintentar con título simplificado (sin subtítulos)
+                resultado = _buscar_hltb(titulo, _token_cache)
+
+                # Reintentar con titulo corto si no hay resultados
+                if resultado is None:
                     titulo_corto = titulo.split(":")[0].split(" - ")[0].strip()
                     if titulo_corto != titulo:
-                        resultados = _buscar_sincrono(titulo_corto)
+                        resultado = _buscar_hltb(titulo_corto, _token_cache)
 
-                if not resultados:
+                if resultado is None:
                     log.warning(f"[HLTB] Sin resultados para: '{titulo}'")
                     return vacio
 
-                juego_hltb = _seleccionar_resultado(resultados, titulo)
-                if juego_hltb is None:
-                    return vacio
-
-                main          = _redondear(juego_hltb.main_story)
-                main_extra    = _redondear(juego_hltb.main_extra)
-                completionist = _redondear(juego_hltb.completionist)
+                main          = _segundos_a_horas(resultado.get("comp_main"))
+                main_extra    = _segundos_a_horas(resultado.get("comp_plus"))
+                completionist = _segundos_a_horas(resultado.get("comp_100"))
 
                 log.info(
-                    f"[HLTB] {titulo} ({juego_hltb.game_name}) → "
-                    f"Main: {main}h | Main+Extra: {main_extra}h | 100%%: {completionist}h"
+                    f"[HLTB] {titulo} -> "
+                    f"Main: {main}h | Main+Extra: {main_extra}h | 100%: {completionist}h"
                 )
                 return {
                     "main":          main,
@@ -124,9 +210,23 @@ class ScraperHLTB:
                     "completionist": completionist,
                 }
 
+            except requests.HTTPError as e:
+                # Si el token expiro, renovarlo en el siguiente intento
+                if e.response is not None and e.response.status_code in (403, 404):
+                    log.warning("[HLTB] Token expirado, renovando...")
+                    _token_cache = None
+                    time.sleep(espera)
+                    espera *= 2
+                else:
+                    if intento < _MAX_REINTENTOS:
+                        time.sleep(espera)
+                        espera *= 2
+                    else:
+                        return vacio
+
             except Exception as e:
                 log.warning(
-                    f"[HLTB] Intento {intento}/{_MAX_REINTENTOS} falló "
+                    f"[HLTB] Intento {intento}/{_MAX_REINTENTOS} fallo "
                     f"para '{titulo}': {e}"
                 )
                 if intento < _MAX_REINTENTOS:
